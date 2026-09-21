@@ -1,0 +1,50 @@
+services:
+  migrate:
+    build: .
+    env_file:
+      - ${BRIDGE_ENV_FILE:-.env}
+    depends_on:
+      db:
+        condition: service_healthy
+    command: alembic upgrade head
+
+  bridge:
+    build: .
+    env_file:
+      - ${BRIDGE_ENV_FILE:-.env}
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  worker:
+    build: .
+    env_file:
+      - ${BRIDGE_ENV_FILE:-.env}
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python -m app.worker
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: bridge
+      POSTGRES_USER: bridge
+      POSTGRES_PASSWORD: bridge
+    volumes:
+      - bridge-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bridge -d bridge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  bridge-postgres:
