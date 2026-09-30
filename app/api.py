@@ -182,7 +182,6 @@ async def _receive_blip_webhook(
     return await _enqueue_blip_message(request, session, payload)
 
 
-@router.post("/")
 @router.post("/webhooks/blip")
 async def receive_blip_webhook(
     request: Request,

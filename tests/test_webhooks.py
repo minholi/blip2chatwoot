@@ -300,7 +300,7 @@ async def test_unified_blip_webhook_dispatches_by_payload_shape(session_factory,
 
 
 @pytest.mark.asyncio
-async def test_unified_blip_webhook_accepts_root_path_with_header_token(
+async def test_unified_blip_webhook_accepts_base_path_with_header_token(
     session_factory,
     settings,
 ) -> None:
@@ -310,13 +310,32 @@ async def test_unified_blip_webhook_accepts_root_path_with_header_token(
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        anonymous = await client.post("/", json=_CUSTOMER_MESSAGE)
+        anonymous = await client.post("/webhooks/blip", json=_CUSTOMER_MESSAGE)
         wrong_path_token = await client.post("/webhooks/blip/wrong", json=_CUSTOMER_MESSAGE)
         accepted = await client.post(
-            "/", json=_CUSTOMER_MESSAGE, headers={"X-Bridge-Token": "route-secret"}
+            "/webhooks/blip", json=_CUSTOMER_MESSAGE, headers={"X-Bridge-Token": "route-secret"}
         )
 
     assert (anonymous.status_code, wrong_path_token.status_code) == (401, 401)
     assert accepted.status_code == 200
+    async with session_factory() as session:
+        assert len((await session.scalars(select(InboundEvent))).all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_blip_webhook_has_no_route_at_the_root(session_factory, settings) -> None:
+    app = FastAPI()
+    app.include_router(router)
+    app.state.runtime = SimpleNamespace(settings=settings, session_factory=session_factory)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        root = await client.post("/", json=_CUSTOMER_MESSAGE)
+        base = await client.post(
+            "/webhooks/blip", json=_CUSTOMER_MESSAGE, headers={"X-Bridge-Token": "route-secret"}
+        )
+
+    assert root.status_code == 404
+    assert base.status_code == 200
     async with session_factory() as session:
         assert len((await session.scalars(select(InboundEvent))).all()) == 1

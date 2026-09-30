@@ -67,9 +67,10 @@ one database and communicate only through it.
 **Webhook auth**: Chatwoot uses an HMAC signature + timestamp (`app/security.py`), enforced only if
 `CHATWOOT_WEBHOOK_SECRET` is set. BLiP has no signature, so it uses a route path token (or
 `X-Bridge-Token` header), enforced only if the token setting is non-empty. BLiP posts everything to one
-URL, so `POST /`, `/webhooks/blip` and `/webhooks/blip/{path_token}` are a unified endpoint that
-dispatches by payload shape (`_receive_blip_webhook`); the per-type `/webhooks/blip/messages|notifications`
-routes (with and without `{path_token}`) remain. `POST /` can only authenticate via the header.
+URL, so `/webhooks/blip` and `/webhooks/blip/{path_token}` are a unified endpoint that dispatches by
+payload shape (`_receive_blip_webhook`); the per-type `/webhooks/blip/messages|notifications` routes (with
+and without `{path_token}`) remain. Without the path token only the header authenticates. There is no
+`POST /` route: BLiP used to post there (until 2026-09-30) and its webhook URL had to be moved first.
 
 **BLiP payload families** (seen on real webhook traffic; rendering lives in `_blip_content_as_text`)
 - Customer → bot (`from` = `<n>@wa.gw.msging.net`): mirrored as `incoming`. `text/plain` and

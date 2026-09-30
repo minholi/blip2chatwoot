@@ -87,12 +87,14 @@ labels, and message statuses.
 
 Point the BLiP webhook at the unified endpoint, which accepts everything BLiP sends
 on one URL and dispatches by payload shape (messages in either direction,
-notifications, and tracking or contact updates, which are acknowledged and dropped):
+notifications, tracking events, which are acknowledged and dropped, and contact
+updates, which are synced onto the Chatwoot contact):
 
 - `https://<public-host>/webhooks/blip/<BLIP_INBOUND_PATH_TOKEN>`
 
-`POST /` and `POST /webhooks/blip` are accepted too, but then the token has to be
-sent as an `X-Bridge-Token` header, which BLiP cannot do by itself.
+`POST /webhooks/blip` is accepted too, but then the token has to be sent as an
+`X-Bridge-Token` header, which BLiP cannot do by itself. There is no route at the
+root (`/`): a BLiP webhook still pointing at it gets a 404.
 
 The legacy per-type URLs still work:
 
