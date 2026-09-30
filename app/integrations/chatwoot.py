@@ -39,6 +39,27 @@ class ChatwootClient:
             json=payload,
         )
 
+    async def get_contact(self, *, contact_id: int) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            f"/api/v1/accounts/{self.settings.chatwoot_account_id}/contacts/{contact_id}",
+        )
+
+    async def update_contact(
+        self,
+        *,
+        contact_id: int,
+        name: str | None = None,
+        email: str | None = None,
+        custom_attributes: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        fields = {"name": name, "email": email, "custom_attributes": custom_attributes}
+        return await self._request(
+            "PUT",
+            f"/api/v1/accounts/{self.settings.chatwoot_account_id}/contacts/{contact_id}",
+            json={key: value for key, value in fields.items() if value is not None},
+        )
+
     async def create_conversation(self, *, source_id: str, contact_id: int) -> dict[str, Any]:
         payload = {
             "source_id": source_id,
@@ -60,7 +81,33 @@ class ChatwootClient:
         message_type: str,
         private: bool = False,
         content_attributes: dict[str, Any] | None = None,
+        as_agent_bot: bool = False,
+        attachments: list[tuple[str, bytes, str]] | None = None,
     ) -> dict[str, Any]:
+        """Post a message; ``attachments`` are ``(filename, data, content type)`` files."""
+        path = (
+            f"/api/v1/accounts/{self.settings.chatwoot_account_id}/conversations/"
+            f"{conversation_id}/messages"
+        )
+        api_token = self.settings.chatwoot_agent_bot_token if as_agent_bot else None
+        if attachments:
+            fields = {
+                "content": content,
+                "message_type": message_type,
+                "private": "true" if private else "false",
+            }
+            for key, value in (content_attributes or {}).items():
+                fields[f"content_attributes[{key}]"] = str(value)
+            return await self._request(
+                "POST",
+                path,
+                api_token=api_token,
+                data=fields,
+                files=[
+                    ("attachments[]", (filename, data, content_type))
+                    for filename, data, content_type in attachments
+                ],
+            )
         payload = {
             "content": content,
             "message_type": message_type,
@@ -68,12 +115,7 @@ class ChatwootClient:
         }
         if content_attributes:
             payload["content_attributes"] = content_attributes
-        return await self._request(
-            "POST",
-            f"/api/v1/accounts/{self.settings.chatwoot_account_id}/conversations/"
-            f"{conversation_id}/messages",
-            json=payload,
-        )
+        return await self._request("POST", path, api_token=api_token, json=payload)
 
     async def get_messages(self, *, conversation_id: int) -> list[dict[str, Any]]:
         response = await self._request(
@@ -160,13 +202,21 @@ class ChatwootClient:
                     if exc.status_code != 422:
                         raise
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        if not self.settings.chatwoot_base_url or not self.settings.chatwoot_api_token:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        api_token: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        token = api_token or self.settings.chatwoot_api_token
+        if not self.settings.chatwoot_base_url or not token:
             raise IntegrationError("Chatwoot credentials are not configured", retryable=False)
         headers = kwargs.pop("headers", {})
         headers.update(
             {
-                "api_access_token": self.settings.chatwoot_api_token,
+                "api_access_token": token,
                 "Accept": "application/json",
             }
         )

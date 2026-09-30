@@ -7,6 +7,7 @@ from app.config import Settings
 from app.db import create_engine, create_session_factory
 from app.integrations.blip import BlipClient
 from app.integrations.chatwoot import ChatwootClient
+from app.integrations.media import MediaDownloader
 
 
 @dataclass
@@ -17,6 +18,7 @@ class Runtime:
     http_client: httpx.AsyncClient
     blip: BlipClient
     chatwoot: ChatwootClient
+    media: MediaDownloader
 
     async def close(self) -> None:
         await self.http_client.aclose()
@@ -35,4 +37,5 @@ def create_runtime(settings: Settings) -> Runtime:
         http_client=http_client,
         blip=BlipClient(settings, http_client),
         chatwoot=ChatwootClient(settings, http_client),
+        media=MediaDownloader(settings, http_client),
     )

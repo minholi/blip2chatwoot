@@ -12,6 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.runtime import Runtime
 from app.security import verify_chatwoot_signature
+from app.services.contact_profile import (
+    enqueue_contact_profile,
+    extract_contact_profile,
+    is_contact_update,
+)
 from app.services.queue import enqueue_event
 
 router = APIRouter()
@@ -54,6 +59,11 @@ async def _json_body(request: Request) -> tuple[bytes, dict[str, Any]]:
     return raw_body, payload
 
 
+def _is_blip_resource_update(payload: dict[str, Any]) -> bool:
+    # BLiP tracking events and contact updates are keyed by `identity`, never by `from`.
+    return "identity" in payload and "from" not in payload
+
+
 async def _receive_blip_message(
     request: Request,
     session: AsyncSession,
@@ -65,6 +75,30 @@ async def _receive_blip_message(
         expected=_runtime(request).settings.blip_inbound_path_token,
     )
     _, payload = await _json_body(request)
+    return await _enqueue_blip_message(request, session, payload)
+
+
+async def _enqueue_blip_message(
+    request: Request,
+    session: AsyncSession,
+    payload: dict[str, Any],
+) -> JSONResponse:
+    if _is_blip_resource_update(payload):
+        profile = (
+            extract_contact_profile(payload)
+            if is_contact_update(payload) and _runtime(request).settings.blip_contact_sync
+            else None
+        )
+        if profile is None:
+            return JSONResponse(
+                status_code=200,
+                content={"accepted": False, "ignored": "unsupported_resource"},
+            )
+        event, created = await enqueue_contact_profile(session, profile)
+        return JSONResponse(
+            status_code=200,
+            content={"accepted": True, "duplicate": not created, "event_id": event.id},
+        )
     message_id = payload.get("id")
     if not message_id or not payload.get("type") or "from" not in payload:
         raise HTTPException(status_code=422, detail="Invalid BLiP message envelope")
@@ -129,6 +163,41 @@ async def receive_blip_notification_with_token(
     )
     raw_body, payload = await _json_body(request)
     return await _enqueue_blip_notification(session, raw_body, payload)
+
+
+async def _receive_blip_webhook(
+    request: Request,
+    session: AsyncSession,
+    supplied_token: str | None = None,
+) -> JSONResponse:
+    _check_blip_token(
+        request,
+        supplied_token,
+        expected=_runtime(request).settings.blip_inbound_path_token,
+    )
+    raw_body, payload = await _json_body(request)
+    is_notification = "event" in payload and "content" not in payload
+    if is_notification and not _is_blip_resource_update(payload):
+        return await _enqueue_blip_notification(session, raw_body, payload)
+    return await _enqueue_blip_message(request, session, payload)
+
+
+@router.post("/")
+@router.post("/webhooks/blip")
+async def receive_blip_webhook(
+    request: Request,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> JSONResponse:
+    return await _receive_blip_webhook(request, session)
+
+
+@router.post("/webhooks/blip/{path_token}")
+async def receive_blip_webhook_with_token(
+    path_token: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
+) -> JSONResponse:
+    return await _receive_blip_webhook(request, session, path_token)
 
 
 async def _enqueue_blip_notification(

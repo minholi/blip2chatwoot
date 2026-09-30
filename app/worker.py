@@ -71,12 +71,15 @@ async def run_once(runtime: Runtime) -> bool:
             settings=runtime.settings,
             blip=runtime.blip,
             chatwoot=runtime.chatwoot,
+            media=runtime.media,
         )
         try:
             if job.kind == "blip_message":
                 await service.process_blip_message(event)
             elif job.kind == "blip_notification":
                 await service.process_blip_notification(event)
+            elif job.kind == "blip_contact":
+                await service.process_blip_contact(event)
             elif job.kind == "chatwoot_event":
                 await service.process_chatwoot_event(event)
             else:
@@ -147,10 +150,13 @@ async def _mark_job_failed(
         and event
         and event.provider == "blip"
         and event.event_type == "message"
+        and runtime.settings.blip_ack_messages
     ):
         message_id = event.payload.get("id")
         customer_identity = event.payload.get("from")
-        if message_id and customer_identity:
+        bot_identity = runtime.settings.blip_bot_identity
+        is_bot_message = bool(bot_identity) and str(customer_identity).split("/")[0] == bot_identity
+        if message_id and customer_identity and not is_bot_message:
             try:
                 await runtime.blip.send_notification(
                     message_id=str(message_id),

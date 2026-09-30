@@ -11,8 +11,14 @@ from app.worker import run_once
 
 
 @pytest.mark.asyncio
-async def test_terminal_blip_failure_is_acknowledged_as_failed(session_factory, settings) -> None:
+@pytest.mark.parametrize("ack_enabled", [True, False])
+async def test_terminal_blip_failure_is_acknowledged_only_when_enabled(
+    session_factory,
+    settings,
+    ack_enabled,
+) -> None:
     settings.max_delivery_attempts = 1
+    settings.blip_ack_messages = ack_enabled
     blip = AsyncMock()
     chatwoot = AsyncMock()
     chatwoot.create_contact.side_effect = IntegrationError("Chatwoot unavailable")
@@ -47,6 +53,7 @@ async def test_terminal_blip_failure_is_acknowledged_as_failed(session_factory, 
         session_factory=session_factory,
         blip=blip,
         chatwoot=chatwoot,
+        media=None,
     )
     assert await run_once(runtime)
 
@@ -56,6 +63,9 @@ async def test_terminal_blip_failure_is_acknowledged_as_failed(session_factory, 
         assert job is not None and job.status == "failed"
         assert saved_event is not None and saved_event.status == "failed"
 
+    if not ack_enabled:
+        blip.send_notification.assert_not_awaited()
+        return
     blip.send_notification.assert_awaited_once_with(
         message_id="message-terminal",
         to="551199999999@wa.gw.msging.net",
