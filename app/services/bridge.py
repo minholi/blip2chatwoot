@@ -26,8 +26,23 @@ from app.services.queue import utcnow
 logger = logging.getLogger(__name__)
 _MAPPING_LOCKS: dict[str, asyncio.Lock] = {}
 _DESK_CONTENT_TYPE_PREFIX = "application/vnd.iris."
+_BOT_NODE_DOMAIN = "msging.net"
 _REACTION_QUOTE_LIMIT = 200
 _TEMPLATE_PLACEHOLDER = re.compile(r"\{\{(\d+)\}\}")
+
+
+def is_bot_node(identity: str, primary: str = "") -> bool:
+    """Whether a BLiP node is a bot: the configured one or any `<name>@msging.net[/instance]`.
+
+    Customers live on channel gateways (`<id>@wa.gw.msging.net`, `@broadcast.msging.net`, ...),
+    never on the bare `msging.net` domain, so a second bot of the same contract (e.g. a receptive
+    bot) is recognised without configuration instead of being mirrored as a customer named after it.
+    """
+    node = identity.partition("/")[0]
+    if primary and node == primary.partition("/")[0]:
+        return True
+    name, _, domain = node.rpartition("@")
+    return bool(name) and domain.lower() == _BOT_NODE_DOMAIN
 
 
 class BridgeService:
@@ -135,7 +150,7 @@ class BridgeService:
                 **extra,
             )
         else:
-            label = f"[{self._outbound_label(message)}]"
+            label = f"[{self._outbound_label(message, self.settings.blip_bot_identity)}]"
             response = await self.chatwoot.create_message(
                 conversation_id=mapping.chatwoot_conversation_id,
                 content=f"{label}\n{content}" if content else label,
@@ -579,10 +594,7 @@ class BridgeService:
         return ("inbound", sender) if "@" in sender else None
 
     def _is_bot_node(self, identity: str) -> bool:
-        bot_identity = self.settings.blip_bot_identity
-        return bool(bot_identity) and (
-            identity == bot_identity or identity.startswith(f"{bot_identity}/")
-        )
+        return is_bot_node(identity, self.settings.blip_bot_identity)
 
     @staticmethod
     def _is_non_content(message: BlipMessage) -> bool:
@@ -597,12 +609,16 @@ class BridgeService:
         )
 
     @staticmethod
-    def _outbound_label(message: BlipMessage) -> str:
+    def _outbound_label(message: BlipMessage, primary_bot: str = "") -> str:
         if message.metadata.get("#messageEmitter") == "Human":
             agent = message.metadata.get("#message.agentIdentity")
             return (
                 f"BLiP agent: {BridgeService._agent_display_name(agent)}" if agent else "BLiP agent"
             )
+        node = message.from_.partition("/")[0]
+        if primary_bot and node != primary_bot.partition("/")[0]:
+            # Another bot of the same contract: say which one, since it isn't the configured bot.
+            return f"BLiP bot: {node.partition('@')[0]}"
         return "BLiP bot"
 
     @staticmethod

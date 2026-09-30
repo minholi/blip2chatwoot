@@ -11,7 +11,7 @@ from app.db import init_db
 from app.integrations.errors import IntegrationError
 from app.models import InboundEvent, MessageDelivery, OutboxJob
 from app.runtime import Runtime, create_runtime
-from app.services.bridge import BridgeService
+from app.services.bridge import BridgeService, is_bot_node
 from app.services.queue import utcnow
 
 logger = logging.getLogger(__name__)
@@ -154,8 +154,7 @@ async def _mark_job_failed(
     ):
         message_id = event.payload.get("id")
         customer_identity = event.payload.get("from")
-        bot_identity = runtime.settings.blip_bot_identity
-        is_bot_message = bool(bot_identity) and str(customer_identity).split("/")[0] == bot_identity
+        is_bot_message = is_bot_node(str(customer_identity), runtime.settings.blip_bot_identity)
         if message_id and customer_identity and not is_bot_message:
             try:
                 await runtime.blip.send_notification(

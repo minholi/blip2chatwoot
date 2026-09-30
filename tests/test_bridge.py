@@ -9,7 +9,7 @@ from app.integrations.errors import IntegrationError
 from app.integrations.media import DownloadedMedia, MediaDownloader
 from app.models import ConversationMapping, InboundEvent, MessageDelivery
 from app.schemas import BlipMessage
-from app.services.bridge import BridgeService
+from app.services.bridge import BridgeService, is_bot_node
 
 
 @pytest.mark.asyncio
@@ -861,3 +861,139 @@ async def test_transient_media_failure_is_left_for_the_worker_to_retry(
 
         chatwoot.create_message.assert_not_awaited()
         assert event.result_id is None
+
+
+@pytest.mark.parametrize(
+    ("identity", "expected"),
+    [
+        ("mybot@msging.net", True),
+        ("mybot@msging.net/router-1", True),
+        ("otherbot@msging.net", True),
+        ("otherbot@msging.net/msging-application-router-5cd4d65d46-abcde", True),
+        ("OtherBot@Msging.Net/x", True),
+        (CUSTOMER, False),
+        ("activecampaign:abc@broadcast.msging.net", False),
+        ("user%40example.com@blip.ai", False),
+        ("someone@example.com", False),
+        ("msging.net", False),
+        ("@msging.net", False),
+        ("", False),
+    ],
+)
+def test_bot_nodes_are_the_configured_bot_or_any_msging_net_application(identity, expected) -> None:
+    assert is_bot_node(identity, "mybot@msging.net") is expected
+
+
+def test_configured_bot_is_recognised_even_outside_the_msging_domain() -> None:
+    assert is_bot_node("custom@bots.example/instance", "custom@bots.example") is True
+    assert is_bot_node("custom@bots.example", "") is False
+
+
+def _second_bot_event(external_id: str, **fields) -> InboundEvent:
+    return _blip_event(
+        external_id,
+        **{"from": "otherbot@msging.net/router-5cd4d65d46-abcde", "to": CUSTOMER, **fields},
+    )
+
+
+@pytest.mark.asyncio
+async def test_message_from_a_second_bot_is_mirrored_to_the_customer_not_as_a_new_customer(
+    session_factory,
+    settings,
+) -> None:
+    chatwoot = _chatwoot_mock()
+    async with session_factory() as session:
+        event = _second_bot_event("other-out-1", content="Hi from the receptive bot")
+        session.add(event)
+        await session.commit()
+
+        service = BridgeService(
+            session=session,
+            settings=settings,
+            blip=AsyncMock(spec=BlipClient),
+            chatwoot=chatwoot,
+        )
+        await service.process_blip_message(event)
+
+        assert chatwoot.create_contact.await_args.kwargs["identifier"] == CUSTOMER
+        chatwoot.create_message.assert_awaited_once_with(
+            conversation_id=200,
+            content="[BLiP bot: otherbot]\nHi from the receptive bot",
+            message_type="outgoing",
+            content_attributes={"blip_message_id": "other-out-1", "blip_direction": "outbound"},
+            as_agent_bot=True,
+        )
+        mappings = (await session.scalars(select(ConversationMapping))).all()
+        assert [m.blip_customer_identity for m in mappings] == [CUSTOMER]
+
+
+@pytest.mark.asyncio
+async def test_second_bot_and_first_bot_share_the_customers_conversation(
+    session_factory,
+    settings,
+) -> None:
+    chatwoot = _chatwoot_mock()
+    chatwoot.create_message.side_effect = [{"id": 300}, {"id": 301}]
+    async with session_factory() as session:
+        session.add(_mapping(settings))
+        first = _blip_event(
+            "first-out",
+            **{"from": f"{settings.blip_bot_identity}/router-1", "to": CUSTOMER, "content": "A"},
+        )
+        second = _second_bot_event("second-out", content="B")
+        session.add_all([first, second])
+        await session.commit()
+        service = BridgeService(
+            session=session,
+            settings=settings,
+            blip=AsyncMock(spec=BlipClient),
+            chatwoot=chatwoot,
+        )
+
+        await service.process_blip_message(first)
+        await service.process_blip_message(second)
+
+        contents = [call.kwargs["content"] for call in chatwoot.create_message.await_args_list]
+        assert contents == ["[BLiP bot]\nA", "[BLiP bot: otherbot]\nB"]
+        assert {
+            call.kwargs["conversation_id"] for call in chatwoot.create_message.await_args_list
+        } == {200}
+        chatwoot.create_contact.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_messages_between_two_bots_are_not_mirrored(session_factory, settings) -> None:
+    chatwoot = _chatwoot_mock()
+    async with session_factory() as session:
+        event = _second_bot_event("bot-to-bot", to=settings.blip_bot_identity, content="handoff")
+        session.add(event)
+        await session.commit()
+        service = BridgeService(
+            session=session,
+            settings=settings,
+            blip=AsyncMock(spec=BlipClient),
+            chatwoot=chatwoot,
+        )
+
+        await service.process_blip_message(event)
+
+        assert event.status == "ignored"
+        chatwoot.create_contact.assert_not_awaited()
+        chatwoot.create_message.assert_not_awaited()
+
+
+def test_labels_name_the_bot_only_when_it_is_not_the_configured_one() -> None:
+    primary = _blip_content("text/plain", "hi")
+    other = BlipMessage.model_validate(
+        {
+            "id": "m",
+            "from": "otherbot@msging.net/router-1",
+            "to": CUSTOMER,
+            "type": "text/plain",
+            "content": "x",
+        }
+    )
+
+    assert BridgeService._outbound_label(primary, "mybot@msging.net") == "BLiP bot"
+    assert BridgeService._outbound_label(other, "mybot@msging.net") == "BLiP bot: otherbot"
+    assert BridgeService._outbound_label(other) == "BLiP bot"

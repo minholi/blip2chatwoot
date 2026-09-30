@@ -72,3 +72,51 @@ async def test_terminal_blip_failure_is_acknowledged_only_when_enabled(
         event="failed",
         reason={"code": 500, "description": "Chatwoot unavailable"},
     )
+
+
+@pytest.mark.asyncio
+async def test_failure_of_a_second_bots_message_is_never_reported_to_blip(
+    session_factory,
+    settings,
+) -> None:
+    settings.max_delivery_attempts = 1
+    settings.blip_ack_messages = True
+    blip = AsyncMock()
+    chatwoot = AsyncMock()
+    chatwoot.create_contact.side_effect = IntegrationError("Chatwoot unavailable")
+
+    async with session_factory() as session:
+        event = InboundEvent(
+            provider="blip",
+            external_id="message:second-bot",
+            event_type="message",
+            payload={
+                "id": "message-second-bot",
+                "from": "otherbot@msging.net/router-1",
+                "to": "551199999999@wa.gw.msging.net",
+                "type": "text/plain",
+                "content": "Hello",
+            },
+        )
+        session.add(event)
+        await session.flush()
+        session.add(
+            OutboxJob(
+                kind="blip_message",
+                idempotency_key="event:blip:message:second-bot",
+                payload={"event_id": event.id, "body": event.payload},
+                next_attempt_at=utcnow(),
+            )
+        )
+        await session.commit()
+
+    runtime = SimpleNamespace(
+        settings=settings,
+        session_factory=session_factory,
+        blip=blip,
+        chatwoot=chatwoot,
+        media=None,
+    )
+    assert await run_once(runtime)
+
+    blip.send_notification.assert_not_awaited()
