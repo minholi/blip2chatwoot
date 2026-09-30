@@ -81,8 +81,13 @@ and without `{path_token}`) remain. Without the path token only the header authe
 - Bot → customer (`from` = `<bot>@msging.net/<instance>`, ~80% of message envelopes): mirrored as `outgoing`
   with a `[BLiP agent: <email>]` / `[BLiP bot]` prefix (`#messageEmitter: Human` +
   `#message.agentIdentity`, URL-encoded `user%40domain@blip.ai`, mark a Desk agent). Routing lives in
-  `_route_message`; `BLIP_BOT_IDENTITY` must match the bot node exactly or the bot's own messages would be
-  treated as customers. They don't reopen a resolved conversation; customer messages do.
+  `_route_message`; a sender is a bot when it is `BLIP_BOT_IDENTITY` or any `<name>@msging.net[/instance]`
+  (`is_bot_node`) — customers live on channel gateways (`@wa.gw.msging.net`, `@broadcast.msging.net`), never
+  on the bare domain. A second bot of the contract (a "receptive" bot, `<other>@msging.net/<router pod>`,
+  appeared 2026-09-30) is therefore mirrored to the customer's conversation with a `[BLiP bot: <name>]` label, and
+  bot → bot handoffs are ignored; before this it was mirrored as a "customer" named after the pod node, one
+  conversation per pod suffix. Mappings keep using `BLIP_BOT_IDENTITY`, so both bots share one conversation
+  per customer. They don't reopen a resolved conversation; customer messages do.
   - `application/json` with `templateContent` = WhatsApp template (campaign sends, `<bot>@msging.net` without
     instance, `#activecampaign.*` metadata): body with `{{n}}` filled from `template.components[body]`,
     plus `Options: [...]` for buttons. Text carries literal `\n`; params often arrive as the unresolved

@@ -103,9 +103,12 @@ The legacy per-type URLs still work:
 - Notification URL:
   `https://<public-host>/webhooks/blip/notifications/<BLIP_NOTIFICATION_PATH_TOKEN>`
 
-Set `BLIP_BOT_IDENTITY` to the exact bot node (for example `mybot@msging.net`):
-it separates customer messages from the copies of the bot's own messages, which
-arrive with the sender `<bot>/<instance>`.
+Set `BLIP_BOT_IDENTITY` to your main bot node (for example `mybot@msging.net`): it
+separates customer messages from the copies of the bot's own messages, which arrive
+with the sender `<bot>/<instance>`, and keys the conversations. Any other
+`<name>@msging.net` node of the same contract (for example a receptive bot) is also
+treated as a bot: its messages are mirrored into the customer's conversation with a
+`[BLiP bot: <name>]` label instead of creating a "customer" named after the bot.
 
 `BLIP_CONTRACT_ID` and `BLIP_AUTH_KEY` are only needed when a BLiP write switch is
 on. The bridge then sends to `https://<contract_id>.http.msging.net/messages`
