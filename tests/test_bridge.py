@@ -280,7 +280,7 @@ async def test_bot_message_is_mirrored_as_outgoing_and_never_acknowledged(
         assert chatwoot.create_contact.await_args.kwargs["identifier"] == CUSTOMER
         chatwoot.create_message.assert_awaited_once_with(
             conversation_id=200,
-            content="Hi there",
+            content="[BLiP agent: agent@example.com]\nHi there",
             message_type="outgoing",
             content_attributes={"blip_message_id": "blip-out-1", "blip_direction": "outbound"},
             as_agent_bot=True,
@@ -709,7 +709,7 @@ def test_reaction_with_no_emoji_is_a_removal_and_ignores_invalid_code_points() -
     assert BridgeService._blip_content_as_text(invalid) == "[Reaction: 👍]"
 
 
-def test_desk_agent_messages_carry_no_label() -> None:
+def test_desk_agent_label_is_decoded() -> None:
     message = _blip_content(
         "text/plain",
         "hi",
@@ -719,7 +719,7 @@ def test_desk_agent_messages_carry_no_label() -> None:
         },
     )
 
-    assert BridgeService._outbound_label(message) is None
+    assert BridgeService._outbound_label(message) == "BLiP agent: jane.doe@example.com"
 
 
 def _media_event(settings, *, sender: str) -> InboundEvent:
@@ -775,7 +775,10 @@ async def test_agent_media_is_attached_instead_of_linked(session_factory, settin
 
 
 @pytest.mark.asyncio
-async def test_desk_agent_file_is_attached_without_any_text(session_factory, settings) -> None:
+async def test_desk_agent_file_is_attached_with_the_agent_label(
+    session_factory,
+    settings,
+) -> None:
     chatwoot = _chatwoot_mock()
     media = AsyncMock(spec=MediaDownloader)
     media.download.return_value = DownloadedMedia("Contract.pdf", "application/pdf", b"%PDF")
@@ -799,7 +802,7 @@ async def test_desk_agent_file_is_attached_without_any_text(session_factory, set
 
         chatwoot.create_message.assert_awaited_once_with(
             conversation_id=200,
-            content="",
+            content="[BLiP agent: jane.doe@example.com]",
             message_type="outgoing",
             content_attributes={"blip_message_id": "blip-media-1", "blip_direction": "outbound"},
             as_agent_bot=True,

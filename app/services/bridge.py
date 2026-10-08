@@ -171,12 +171,10 @@ class BridgeService:
                 **extra,
             )
         else:
-            label = self._outbound_label(message, self.settings.blip_bot_identity)
-            if label:
-                content = f"[{label}]\n{content}" if content else f"[{label}]"
+            label = f"[{self._outbound_label(message, self.settings.blip_bot_identity)}]"
             response = await self.chatwoot.create_message(
                 conversation_id=mapping.chatwoot_conversation_id,
-                content=content,
+                content=f"{label}\n{content}" if content else label,
                 message_type="outgoing",
                 content_attributes={"blip_message_id": message.id, "blip_direction": "outbound"},
                 as_agent_bot=True,
@@ -786,10 +784,13 @@ class BridgeService:
         )
 
     @staticmethod
-    def _outbound_label(message: BlipMessage, primary_bot: str = "") -> str | None:
-        """Prefix naming a bot sender; None for a Desk agent, who is shown by the assignment."""
+    def _outbound_label(message: BlipMessage, primary_bot: str = "") -> str:
+        """Prefix naming who sent the message: the Desk agent's e-mail, or the bot."""
         if message.metadata.get("#messageEmitter") == "Human":
-            return None
+            agent = message.metadata.get("#message.agentIdentity")
+            return (
+                f"BLiP agent: {BridgeService._agent_display_name(agent)}" if agent else "BLiP agent"
+            )
         node = message.from_.partition("/")[0]
         if primary_bot and node != primary_bot.partition("/")[0]:
             # Another bot of the same contract: say which one, since it isn't the configured bot.

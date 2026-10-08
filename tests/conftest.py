@@ -21,7 +21,9 @@ async def session_factory() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
 
 @pytest_asyncio.fixture
 def settings() -> Settings:
+    # `_env_file=None`: tests must not pick up the developer's real .env (switches, keys).
     return Settings(
+        _env_file=None,
         database_url="sqlite+aiosqlite:///:memory:",
         chatwoot_base_url="https://chatwoot.example",
         chatwoot_account_id=10,

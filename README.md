@@ -102,10 +102,9 @@ request the e-mail-derived name is used.
 
 The conversation is reassigned only when a different BLiP agent writes, so a manual
 reassignment in Chatwoot stands until then. The messages themselves are still posted
-by the Agent Bot, not as the agent's user, and carry no label: who is answering is shown
-by the conversation's assignee. Without `CHATWOOT_AGENT_SYNC`, Desk agent messages are
-therefore not attributed to anyone in Chatwoot. Messages from a bot still start with
-`[BLiP bot]` (or `[BLiP bot: <name>]` for a second bot of the contract).
+by the Agent Bot, not as the agent's user. Each one starts with `[BLiP agent: e-mail]`
+(or `[BLiP bot]` / `[BLiP bot: <name>]` for a bot), so the operator of every single message
+stays visible, while the conversation's assignee shows who is answering now.
 A Chatwoot failure while assigning is logged and retried on the agent's next message;
 it never blocks the mirror.
 

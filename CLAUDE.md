@@ -103,9 +103,9 @@ and without `{path_token}`) remain. Without the path token only the header authe
   points; empty = removed); other types fall back to `[BLiP message type: …]` + serialized JSON. Customer
   media (image/audio/document/location) has never been observed — no renderer beyond the generic `uri` path.
 - Bot → customer (`from` = `<bot>@msging.net/<instance>`, ~80% of message envelopes): mirrored as `outgoing`
-  with a `[BLiP bot]` / `[BLiP bot: <name>]` prefix, or none for a Desk agent (`#messageEmitter: Human` +
-  `#message.agentIdentity`, URL-encoded `user%40domain@blip.ai`): the agent is shown by the conversation
-  assignment (`CHATWOOT_AGENT_SYNC`), not in the text. Routing lives in
+  with a `[BLiP agent: <email>]` / `[BLiP bot]` prefix (`#messageEmitter: Human` +
+  `#message.agentIdentity`, URL-encoded `user%40domain@blip.ai`, mark a Desk agent), so every message shows
+  who sent it; the assignment (`CHATWOOT_AGENT_SYNC`) only shows the current operator. Routing lives in
   `_route_message`; a sender is a bot when it is `BLIP_BOT_IDENTITY` or any `<name>@msging.net[/instance]`
   (`is_bot_node`) — customers live on channel gateways (`@wa.gw.msging.net`, `@broadcast.msging.net`), never
   on the bare domain. A second bot of the contract (a "receptive" bot, `<other>@msging.net/<router pod>`,
@@ -172,7 +172,8 @@ in-memory — export it before restarting ngrok. When starting the processes loc
 
 ## Testing conventions
 
-- Tests use in-memory SQLite via the `session_factory` and `settings` fixtures in `tests/conftest.py`.
+- Tests use in-memory SQLite via the `session_factory` and `settings` fixtures in `tests/conftest.py`. The `settings` fixture
+  passes `_env_file=None`, so a developer's real `.env` (switches, keys) never leaks into the tests.
 - API tests mount `app.api.router` on a bare `FastAPI()` with
   `app.state.runtime = SimpleNamespace(settings=..., session_factory=...)` and call it through
   `httpx.ASGITransport` — the lifespan is not run.
