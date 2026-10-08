@@ -58,8 +58,14 @@ Two processes share one database and communicate only through it.
   asyncio locks only; cross-process safety comes from the unique constraints (`_create_mapping` handles
   `IntegrityError`).
 - Chatwoot dedupe key is the `X-Chatwoot-Delivery` header, falling back to a body hash. When replies
-  are enabled, only public outgoing messages from a `user` sender are forwarded, and only as
-  `text/plain` (attachments become text placeholders).
+  are enabled, only public outgoing messages from a `user` sender are forwarded: as `text/plain`, or, when
+  there is an image/audio/video/document attachment (`file_type` image|audio|video|file with a `content_type`),
+  the first one as an `application/vnd.lime.media-link+json` of its Chatwoot `data_url` (a public redirect to the
+  file) with the text as caption (`_chatwoot_outbound_content`); further or unsupported attachments stay text lines. `CHATWOOT_REPLIES_ALLOWED_CONVERSATIONS` (comma-separated
+  Chatwoot conversation ids; empty = all) restricts forwarding to those conversations for a pilot — checked in
+  `_process_chatwoot_message` before any `MessageDelivery` or BLiP call, and parsed strictly (a typo stops the
+  startup, since falling back to "empty" would open every conversation). Replies go out with `BLIP_AUTH_KEY`,
+  which must be the key of the mapping's bot (`BLIP_BOT_IDENTITY`).
 - **Echo protection** — a mirrored `outgoing` message triggers a Chatwoot `message_created` webhook that
   must never reach BLiP. Layers: the replies switch; `content_attributes.blip_message_id` on the payload;
   a `MessageDelivery(status="mirrored")` row written in the same commit as `result_id`. The reverse echo

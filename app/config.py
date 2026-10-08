@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +19,9 @@ class Settings(BaseSettings):
     chatwoot_webhook_secret: str = ""
     chatwoot_agent_bot_token: str = ""
     chatwoot_replies_to_blip: bool = False
+    # Comma-separated Chatwoot conversation ids. When set, only replies in these conversations are
+    # forwarded to BLiP; empty means every conversation of the inbox (a pilot safeguard).
+    chatwoot_replies_allowed_conversations: str = ""
     # Assign each conversation to the BLiP Desk agent who last wrote in it, creating that agent's
     # Chatwoot user when missing (Chatwoot e-mails them an invitation). Only calls Chatwoot.
     chatwoot_agent_sync: bool = False
@@ -54,6 +58,22 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    @field_validator("chatwoot_replies_allowed_conversations")
+    @classmethod
+    def _reply_conversations_are_ids(cls, value: str) -> str:
+        # Fail at startup: a typo must not silently turn the allow-list into "every conversation".
+        items = [item.strip() for item in value.split(",") if item.strip()]
+        if (value.strip() and not items) or not all(item.isdigit() for item in items):
+            raise ValueError(
+                "CHATWOOT_REPLIES_ALLOWED_CONVERSATIONS must be comma-separated conversation ids"
+            )
+        return value
+
+    @property
+    def chatwoot_reply_conversation_ids(self) -> frozenset[int]:
+        items = (item.strip() for item in self.chatwoot_replies_allowed_conversations.split(","))
+        return frozenset(int(item) for item in items if item)
 
     @property
     def blip_writes_enabled(self) -> bool:

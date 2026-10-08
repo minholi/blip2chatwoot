@@ -84,6 +84,22 @@ The API is available on `http://localhost:8000`. Health endpoints are
 The API token needs permission to create contacts, conversations, messages,
 labels, and message statuses.
 
+### Replying from Chatwoot
+
+With `CHATWOOT_REPLIES_TO_BLIP=true`, a public reply typed by a Chatwoot user (private notes
+and the bridge's own mirrored messages are never forwarded) is sent to the customer as a
+`text/plain` message from the conversation's bot, using `BLIP_AUTH_KEY`, so that key must belong
+to the bot the customer is talking to. An image, audio, video or document attached to the reply
+goes as a media message that links to the file in Chatwoot (the message text is its caption); only
+the first attachment is sent as media, and any others are appended to the caption as links. The Chatwoot message shows `sent` once BLiP accepted it,
+or `failed` with BLiP's reason. WhatsApp only accepts free text within 24 hours of the
+customer's last message.
+
+The switch covers the whole inbox, so while piloting it set
+`CHATWOOT_REPLIES_ALLOWED_CONVERSATIONS` (for example `4888`): only those conversations send
+anything to BLiP, and replies in the others are ignored. Empty means all of them. A malformed
+value stops the startup rather than being treated as empty.
+
 ### Assigning conversations to BLiP Desk agents
 
 Set `CHATWOOT_AGENT_SYNC=true` to assign each conversation to the BLiP Desk agent who

@@ -509,6 +509,169 @@ async def test_chatwoot_message_is_not_forwarded_to_blip(session_factory, settin
         assert event.status == "processed"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("allowed", "forwarded"),
+    [
+        ("", True),
+        ("200", True),
+        (" 7, 200 ,9 ", True),
+        ("7,9", False),
+        ("4888", False),
+    ],
+    ids=["empty-allows-all", "listed", "listed-with-spaces", "other-ids", "other-conversation"],
+)
+async def test_replies_are_only_forwarded_for_the_allowed_conversations(
+    session_factory,
+    settings,
+    allowed,
+    forwarded,
+) -> None:
+    settings.chatwoot_replies_to_blip = True
+    settings.chatwoot_replies_allowed_conversations = allowed
+    blip = AsyncMock(spec=BlipClient)
+    chatwoot = AsyncMock(spec=ChatwootClient)
+    async with session_factory() as session:
+        session.add(_mapping(settings))
+        await session.commit()
+        event = InboundEvent(
+            provider="chatwoot",
+            external_id="message_created:allow",
+            event_type="message_created",
+            payload=_agent_reply(),
+        )
+        session.add(event)
+        await session.commit()
+
+        service = BridgeService(session=session, settings=settings, blip=blip, chatwoot=chatwoot)
+        await service.process_chatwoot_event(event)
+
+        assert event.status == "processed"
+        if forwarded:
+            blip.send_message.assert_awaited_once()
+            chatwoot.update_message_status.assert_awaited_once()
+        else:
+            blip.send_message.assert_not_awaited()
+            chatwoot.update_message_status.assert_not_awaited()
+            assert await session.scalar(select(MessageDelivery)) is None
+
+
+IMAGE_URL = "https://chatwoot.example/rails/active_storage/blobs/redirect/SIGNED/photo%20one.jpg"
+PDF_URL = "https://chatwoot.example/rails/active_storage/blobs/redirect/SIGNED/Contract%20v2.pdf"
+
+
+def _attachment(url: str, file_type: str, content_type: str, **extra) -> dict:
+    return {"data_url": url, "file_type": file_type, "content_type": content_type, **extra}
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_type", "expected"),
+    [
+        (
+            {
+                "content": "",
+                "attachments": [_attachment(IMAGE_URL, "image", "image/jpeg", file_size=2041793)],
+            },
+            "application/vnd.lime.media-link+json",
+            {"type": "image/jpeg", "uri": IMAGE_URL, "size": 2041793},
+        ),
+        (
+            {
+                "content": "  Here it is  ",
+                "attachments": [_attachment(IMAGE_URL, "image", "image/png")],
+            },
+            "application/vnd.lime.media-link+json",
+            {"type": "image/png", "uri": IMAGE_URL, "text": "Here it is"},
+        ),
+        (
+            {"content": "", "attachments": [_attachment(PDF_URL, "file", "application/pdf")]},
+            "application/vnd.lime.media-link+json",
+            {"type": "application/pdf", "uri": PDF_URL, "title": "Contract v2.pdf"},
+        ),
+        (
+            {
+                "content": "Two files",
+                "attachments": [
+                    _attachment(IMAGE_URL, "image", "image/jpeg"),
+                    _attachment(PDF_URL, "file", "application/pdf"),
+                ],
+            },
+            "application/vnd.lime.media-link+json",
+            {
+                "type": "image/jpeg",
+                "uri": IMAGE_URL,
+                "text": f"Two files\n[Chatwoot attachment: {PDF_URL}]",
+            },
+        ),
+        (
+            {"content": "Just text"},
+            "text/plain",
+            "Just text",
+        ),
+        (
+            {"content": "", "attachments": [_attachment(IMAGE_URL, "location", "image/jpeg")]},
+            "text/plain",
+            f"[Chatwoot attachment: {IMAGE_URL}]",
+        ),
+        (
+            {"content": "", "attachments": [{"file_type": "image", "content_type": "image/jpeg"}]},
+            "text/plain",
+            "[Chatwoot message without text]",
+        ),
+        (
+            {"content": "", "attachments": [_attachment(IMAGE_URL, "image", "")]},
+            "text/plain",
+            f"[Chatwoot attachment: {IMAGE_URL}]",
+        ),
+    ],
+    ids=[
+        "image-only",
+        "image-with-caption",
+        "document-with-filename",
+        "extra-attachment-in-caption",
+        "plain-text",
+        "unsupported-type-stays-text",
+        "attachment-without-url",
+        "attachment-without-content-type",
+    ],
+)
+def test_chatwoot_reply_is_converted_for_blip(payload, expected_type, expected) -> None:
+    assert BridgeService._chatwoot_outbound_content(payload) == (expected_type, expected)
+
+
+@pytest.mark.asyncio
+async def test_image_reply_is_sent_to_blip_as_a_media_link(session_factory, settings) -> None:
+    settings.chatwoot_replies_to_blip = True
+    blip = AsyncMock(spec=BlipClient)
+    chatwoot = AsyncMock(spec=ChatwootClient)
+    async with session_factory() as session:
+        session.add(_mapping(settings))
+        await session.commit()
+        event = InboundEvent(
+            provider="chatwoot",
+            external_id="message_created:image",
+            event_type="message_created",
+            payload=_agent_reply(
+                content="", attachments=[_attachment(IMAGE_URL, "image", "image/jpeg")]
+            ),
+        )
+        session.add(event)
+        await session.commit()
+
+        service = BridgeService(session=session, settings=settings, blip=blip, chatwoot=chatwoot)
+        await service.process_chatwoot_event(event)
+
+        call = blip.send_message.await_args.kwargs
+        assert call["to"] == CUSTOMER
+        assert call["message_type"] == "application/vnd.lime.media-link+json"
+        assert call["content"] == {"type": "image/jpeg", "uri": IMAGE_URL}
+        delivery = await session.scalar(select(MessageDelivery))
+        assert (delivery.status, delivery.blip_message_id) == ("sent", call["message_id"])
+        chatwoot.update_message_status.assert_awaited_once_with(
+            conversation_id=200, message_id=300, status="sent"
+        )
+
+
 def test_media_link_is_rendered_with_type_and_caption() -> None:
     message = BlipMessage.model_validate(
         {

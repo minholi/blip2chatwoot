@@ -45,6 +45,9 @@ class _AttendantDirectory:
 _ATTENDANTS = _AttendantDirectory()
 _DESK_CONTENT_TYPE_PREFIX = "application/vnd.iris."
 _BOT_NODE_DOMAIN = "msging.net"
+_MEDIA_LINK_TYPE = "application/vnd.lime.media-link+json"
+# Chatwoot attachment `file_type`s that BLiP can carry as a media link ("file" is a document).
+_CHATWOOT_MEDIA_FILE_TYPES = frozenset({"image", "audio", "video", "file"})
 _REACTION_QUOTE_LIMIT = 200
 _TEMPLATE_PLACEHOLDER = re.compile(r"\{\{(\d+)\}\}")
 
@@ -301,6 +304,14 @@ class BridgeService:
         message_id = self._optional_int(payload.get("id"))
         if message_id is None:
             return
+        allowed = self.settings.chatwoot_reply_conversation_ids
+        if allowed and mapping.chatwoot_conversation_id not in allowed:
+            logger.info(
+                "Reply in Chatwoot conversation %s not forwarded: not in "
+                "CHATWOOT_REPLIES_ALLOWED_CONVERSATIONS",
+                mapping.chatwoot_conversation_id,
+            )
+            return
 
         delivery = await self.session.scalar(
             select(MessageDelivery).where(MessageDelivery.chatwoot_message_id == message_id)
@@ -332,10 +343,10 @@ class BridgeService:
             self.session.add(delivery)
             await self.session.commit()
 
-        content = self._chatwoot_content_as_text(payload)
+        message_type, content = self._chatwoot_outbound_content(payload)
         await self.blip.send_message(
             to=mapping.blip_customer_identity,
-            message_type="text/plain",
+            message_type=message_type,
             content=content,
             message_id=delivery.blip_message_id,
         )
@@ -1007,6 +1018,47 @@ class BridgeService:
             quote = "\n".join(f"> {line}" for line in quoted.splitlines())
             return f"{text}\n{quote}"
         return text
+
+    @staticmethod
+    def _chatwoot_outbound_content(payload: dict[str, Any]) -> tuple[str, Any]:
+        """The BLiP ``(type, content)`` for a Chatwoot agent message.
+
+        The first image/audio/video/document attachment goes as a media link to its Chatwoot URL,
+        with the message text (plus a link line per further attachment) as caption. Anything else
+        stays ``text/plain``, attachments rendered as text.
+        """
+        attachments = [
+            item
+            for item in payload.get("attachments") or []
+            if isinstance(item, dict) and item.get("data_url")
+        ]
+        media = next(
+            (
+                item
+                for item in attachments
+                if item.get("file_type") in _CHATWOOT_MEDIA_FILE_TYPES
+                and isinstance(item.get("content_type"), str)
+                and item["content_type"]
+            ),
+            None,
+        )
+        if media is None:
+            return "text/plain", BridgeService._chatwoot_content_as_text(payload)
+        link: dict[str, Any] = {"type": media["content_type"], "uri": media["data_url"]}
+        if isinstance(media.get("file_size"), int):
+            link["size"] = media["file_size"]
+        if media.get("file_type") == "file":
+            # Documents show their file name; Chatwoot only exposes it as the URL's last segment.
+            filename = unquote(urlsplit(str(media["data_url"])).path.rsplit("/", 1)[-1])
+            if filename:
+                link["title"] = filename
+        text = payload.get("content")
+        caption = [text.strip()] if isinstance(text, str) and text.strip() else []
+        extra = (item["data_url"] for item in attachments if item is not media)
+        caption += [f"[Chatwoot attachment: {url}]" for url in extra]
+        if caption:
+            link["text"] = "\n".join(caption)
+        return _MEDIA_LINK_TYPE, link
 
     @staticmethod
     def _chatwoot_content_as_text(payload: dict[str, Any]) -> str:

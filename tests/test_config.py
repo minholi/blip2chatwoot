@@ -54,3 +54,24 @@ def test_agent_sync_is_off_by_default_and_needs_no_blip_credentials() -> None:
 
     enabled.validate_for_environment()
     assert enabled.blip_writes_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", frozenset()),
+        ("4888", frozenset({4888})),
+        (" 4888 , 12,,", frozenset({4888, 12})),
+    ],
+)
+def test_reply_allow_list_is_parsed_into_conversation_ids(raw, expected) -> None:
+    settings = Settings(_env_file=None, chatwoot_replies_allowed_conversations=raw)
+
+    assert settings.chatwoot_reply_conversation_ids == expected
+
+
+@pytest.mark.parametrize("raw", ["4888,abc", "#4888", "-1", ",", "48 88"])
+def test_a_malformed_reply_allow_list_stops_the_startup(raw) -> None:
+    # Falling back to "empty" would silently allow replies in every conversation.
+    with pytest.raises(ValueError, match="CHATWOOT_REPLIES_ALLOWED_CONVERSATIONS"):
+        Settings(_env_file=None, chatwoot_replies_allowed_conversations=raw)
