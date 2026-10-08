@@ -9,6 +9,10 @@ import httpx
 from app.config import Settings
 from app.integrations.errors import IntegrationError
 
+_DESK_NODE_SUFFIX = "@desk.msging.net"
+_ATTENDANT_PAGE_SIZE = 100
+_MAX_ATTENDANT_PAGES = 20
+
 
 class BlipClient:
     def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
@@ -83,7 +87,7 @@ class BlipClient:
             payload["type"] = media_type
         if resource is not None:
             payload["resource"] = resource
-        response = await self._post(self.commands_url, payload)
+        response = await self._post(self.commands_url, payload, auth_key=self._auth_key_for(to))
         if response.get("status") == "failure":
             reason = response.get("reason") or {}
             raise IntegrationError(
@@ -118,6 +122,22 @@ class BlipClient:
             resource={"id": ticket_id, "tags": tags},
         )
 
+    async def get_attendants(self) -> list[dict[str, Any]]:
+        """BLiP Desk operators (``identity``, ``fullName``, ``email``, ``teams``...), all pages."""
+        attendants: list[dict[str, Any]] = []
+        for _ in range(_MAX_ATTENDANT_PAGES):
+            response = await self.command(
+                method="get",
+                uri=f"/attendants?$skip={len(attendants)}&$take={_ATTENDANT_PAGE_SIZE}",
+            )
+            resource = response.get("resource") or {}
+            items = [item for item in resource.get("items", []) if isinstance(item, dict)]
+            attendants.extend(items)
+            total = resource.get("total")
+            if not items or not isinstance(total, int) or len(attendants) >= total:
+                break
+        return attendants
+
     async def get_active_tags(self) -> set[str]:
         response = await self.command(method="get", uri="/tags/active")
         resource = response.get("resource") or {}
@@ -127,15 +147,28 @@ class BlipClient:
             if isinstance(item, dict) and item.get("name")
         }
 
-    async def _post(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if not self.settings.blip_contract_id or not self.settings.blip_auth_key:
+    def _auth_key_for(self, to: str) -> str:
+        """Desk commands use the Desk bot's key when one is configured, the rest the main key."""
+        if to.endswith(_DESK_NODE_SUFFIX) and self.settings.blip_desk_auth_key:
+            return self.settings.blip_desk_auth_key
+        return self.settings.blip_auth_key
+
+    async def _post(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        *,
+        auth_key: str | None = None,
+    ) -> dict[str, Any]:
+        key = auth_key or self.settings.blip_auth_key
+        if not self.settings.blip_contract_id or not key:
             raise IntegrationError("BLiP credentials are not configured", retryable=False)
         try:
             response = await self._client.post(
                 url,
                 json=payload,
                 headers={
-                    "Authorization": f"Key {self.settings.blip_auth_key}",
+                    "Authorization": f"Key {key}",
                     "Content-Type": "application/json",
                 },
             )

@@ -154,6 +154,44 @@ class ChatwootClient:
             json=payload,
         )
 
+    async def list_agents(self) -> list[dict[str, Any]]:
+        data = await self._request_json(
+            "GET",
+            f"/api/v1/accounts/{self.settings.chatwoot_account_id}/agents",
+        )
+        return self._dict_items(data)
+
+    async def create_agent(self, *, name: str, email: str) -> dict[str, Any]:
+        """Create a plain ``agent``, never an administrator; Chatwoot e-mails them an invitation."""
+        return await self._request(
+            "POST",
+            f"/api/v1/accounts/{self.settings.chatwoot_account_id}/agents",
+            json={"name": name, "email": email, "role": "agent"},
+        )
+
+    async def add_inbox_agents(self, user_ids: list[int]) -> list[dict[str, Any]]:
+        """Add agents to the inbox. Additive and idempotent (``PATCH`` is the one that replaces)."""
+        data = await self._request_json(
+            "POST",
+            f"/api/v1/accounts/{self.settings.chatwoot_account_id}/inbox_members",
+            json={"inbox_id": self.settings.chatwoot_inbox_id, "user_ids": user_ids},
+        )
+        # The documented body is an array; the real server wraps it as {"payload": [...]}.
+        return self._dict_items(data.get("payload") if isinstance(data, dict) else data)
+
+    async def assign_conversation(
+        self,
+        *,
+        conversation_id: int,
+        assignee_id: int,
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            f"/api/v1/accounts/{self.settings.chatwoot_account_id}/conversations/"
+            f"{conversation_id}/assignments",
+            json={"assignee_id": assignee_id},
+        )
+
     async def get_conversation_labels(self, *, conversation_id: int) -> list[str]:
         response = await self._request(
             "GET",
@@ -202,6 +240,10 @@ class ChatwootClient:
                     if exc.status_code != 422:
                         raise
 
+    @staticmethod
+    def _dict_items(data: Any) -> list[dict[str, Any]]:
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
     async def _request(
         self,
         method: str,
@@ -210,6 +252,18 @@ class ChatwootClient:
         api_token: str | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        data = await self._request_json(method, path, api_token=api_token, **kwargs)
+        return data if isinstance(data, dict) else {}
+
+    async def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        api_token: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """The decoded JSON body, or None when empty/not JSON; some endpoints return arrays."""
         token = api_token or self.settings.chatwoot_api_token
         if not self.settings.chatwoot_base_url or not token:
             raise IntegrationError("Chatwoot credentials are not configured", retryable=False)
@@ -242,9 +296,8 @@ class ChatwootClient:
                 status_code=response.status_code,
             )
         if not response.content:
-            return {}
+            return None
         try:
-            data = response.json()
+            return response.json()
         except ValueError:
-            return {}
-        return data if isinstance(data, dict) else {}
+            return None

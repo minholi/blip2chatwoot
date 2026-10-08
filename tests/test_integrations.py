@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 
@@ -165,3 +167,140 @@ async def test_chatwoot_contact_is_read_and_updated_with_only_the_given_fields(s
     assert (requests[0].method, requests[0].url.path) == ("GET", "/api/v1/accounts/10/contacts/9")
     assert (requests[1].method, requests[1].url.path) == ("PUT", "/api/v1/accounts/10/contacts/9")
     assert requests[1].content == b'{"name":"Ana","custom_attributes":{"crm_id":1}}'
+
+
+@pytest.mark.asyncio
+async def test_chatwoot_agents_are_listed_created_and_added_to_the_inbox(settings) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json=[{"id": 7, "email": "a@example.com"}, "junk"])
+        if request.url.path.endswith("/inbox_members"):
+            # The real server wraps the member list as {"payload": [...]}; the docs show an array.
+            return httpx.Response(200, json={"payload": [{"id": 7}, {"id": 8}]})
+        return httpx.Response(200, json={"id": 8, "email": "b@example.com"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    chatwoot = ChatwootClient(settings, client)
+    agents = await chatwoot.list_agents()
+    created = await chatwoot.create_agent(name="B", email="b@example.com")
+    members = await chatwoot.add_inbox_agents([8])
+    await client.aclose()
+
+    assert agents == [{"id": 7, "email": "a@example.com"}]
+    assert created["id"] == 8
+    assert members == [{"id": 7}, {"id": 8}]
+    assert [(r.method, r.url.path) for r in requests] == [
+        ("GET", "/api/v1/accounts/10/agents"),
+        ("POST", "/api/v1/accounts/10/agents"),
+        ("POST", "/api/v1/accounts/10/inbox_members"),
+    ]
+    assert json.loads(requests[1].content) == {
+        "name": "B",
+        "email": "b@example.com",
+        "role": "agent",
+    }
+    assert json.loads(requests[2].content) == {"inbox_id": 20, "user_ids": [8]}
+
+
+@pytest.mark.asyncio
+async def test_chatwoot_conversation_is_assigned_to_a_user(settings) -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": 7})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    chatwoot = ChatwootClient(settings, client)
+    await chatwoot.assign_conversation(conversation_id=5, assignee_id=7)
+    await client.aclose()
+
+    assert requests[0].url.path == "/api/v1/accounts/10/conversations/5/assignments"
+    assert json.loads(requests[0].content) == {"assignee_id": 7}
+
+
+@pytest.mark.asyncio
+async def test_chatwoot_dict_endpoints_ignore_non_object_bodies(settings) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[1, 2])
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    chatwoot = ChatwootClient(settings, client)
+    response = await chatwoot.assign_conversation(conversation_id=5, assignee_id=7)
+    await client.aclose()
+
+    assert response == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("desk_key", "desk_expected", "other_expected"),
+    [("desk-key", "Key desk-key", "Key blip-key"), ("", "Key blip-key", "Key blip-key")],
+)
+async def test_blip_desk_commands_use_the_desk_key_when_configured(
+    settings,
+    desk_key,
+    desk_expected,
+    other_expected,
+) -> None:
+    settings.blip_desk_auth_key = desk_key
+    auth_by_target: dict[str, str] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        auth_by_target[body.get("to", "")] = request.headers["Authorization"]
+        return httpx.Response(200, json={"status": "success", "resource": {}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    blip = BlipClient(settings, client)
+    await blip.command(method="get", uri="/tags/active")
+    await blip.command(method="get", uri="/account", to="postmaster@msging.net")
+    await client.aclose()
+
+    assert auth_by_target["postmaster@desk.msging.net"] == desk_expected
+    assert auth_by_target["postmaster@msging.net"] == other_expected
+
+
+@pytest.mark.asyncio
+async def test_blip_attendants_are_read_page_by_page(settings) -> None:
+    settings.blip_desk_auth_key = "desk-key"
+    pages = {
+        "/attendants?$skip=0&$take=100": ([{"fullName": f"A{i}"} for i in range(100)], 101),
+        "/attendants?$skip=100&$take=100": ([{"fullName": "Last"}], 101),
+    }
+    uris: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        uris.append(body["uri"])
+        assert body["to"] == "postmaster@desk.msging.net"
+        assert body["method"] == "get"
+        items, total = pages[body["uri"]]
+        return httpx.Response(
+            200, json={"status": "success", "resource": {"total": total, "items": items}}
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    attendants = await BlipClient(settings, client).get_attendants()
+    await client.aclose()
+
+    assert len(attendants) == 101
+    assert attendants[-1] == {"fullName": "Last"}
+    assert uris == list(pages)
+
+
+@pytest.mark.asyncio
+async def test_blip_attendants_stop_on_an_empty_page(settings) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"status": "success", "resource": {"total": 5, "items": []}}
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    attendants = await BlipClient(settings, client).get_attendants()
+    await client.aclose()
+
+    assert attendants == []

@@ -34,6 +34,8 @@ class ConversationMapping(Base):
     chatwoot_source_id: Mapped[str] = mapped_column(String(512), nullable=False)
     chatwoot_conversation_id: Mapped[int] = mapped_column(Integer, nullable=False)
     blip_ticket_id: Mapped[str | None] = mapped_column(String(255))
+    # E-mail of the BLiP Desk agent the conversation was last assigned to in Chatwoot.
+    blip_agent_identity: Mapped[str | None] = mapped_column(String(255))
     chatwoot_labels: Mapped[list[str]] = mapped_column(JsonType, default=list, nullable=False)
     blip_tags: Mapped[list[str]] = mapped_column(JsonType, default=list, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="open", nullable=False)

@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import re
+import time
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, uuid5
@@ -25,6 +27,22 @@ from app.services.queue import utcnow
 
 logger = logging.getLogger(__name__)
 _MAPPING_LOCKS: dict[str, asyncio.Lock] = {}
+# Chatwoot agent ids by (account, e-mail), so a Desk agent is looked up or created once per worker.
+_AGENT_LOCKS: dict[str, asyncio.Lock] = {}
+_AGENT_USER_IDS: dict[tuple[int, str], int] = {}
+_EMAIL_SHAPE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_ATTENDANT_REFRESH_SECONDS = 600
+
+
+@dataclass
+class _AttendantDirectory:
+    """BLiP Desk operator names by e-mail, loaded on demand and refreshed on a miss."""
+
+    names: dict[str, str] = field(default_factory=dict)
+    loaded_at: float | None = None
+
+
+_ATTENDANTS = _AttendantDirectory()
 _DESK_CONTENT_TYPE_PREFIX = "application/vnd.iris."
 _BOT_NODE_DOMAIN = "msging.net"
 _REACTION_QUOTE_LIMIT = 200
@@ -110,6 +128,9 @@ class BridgeService:
                 event.attempts += 1
                 await self.session.commit()
 
+            if direction == "outbound":
+                await self._sync_agent_assignment(mapping, message)
+
             if direction == "inbound" and self.settings.blip_ack_messages:
                 await self.blip.send_notification(
                     message_id=message.id,
@@ -150,10 +171,12 @@ class BridgeService:
                 **extra,
             )
         else:
-            label = f"[{self._outbound_label(message, self.settings.blip_bot_identity)}]"
+            label = self._outbound_label(message, self.settings.blip_bot_identity)
+            if label:
+                content = f"[{label}]\n{content}" if content else f"[{label}]"
             response = await self.chatwoot.create_message(
                 conversation_id=mapping.chatwoot_conversation_id,
-                content=f"{label}\n{content}" if content else label,
+                content=content,
                 message_type="outgoing",
                 content_attributes={"blip_message_id": message.id, "blip_direction": "outbound"},
                 as_agent_bot=True,
@@ -449,6 +472,7 @@ class BridgeService:
             chatwoot_contact_id=contact_id,
             chatwoot_source_id=source_id,
             chatwoot_conversation_id=conversation_id,
+            status=str(conversation.get("status") or "open"),
         )
         self.session.add(mapping)
         try:
@@ -459,6 +483,7 @@ class BridgeService:
             if existing:
                 return existing
             raise
+        await self._open_pending_conversation(mapping)
         await self._apply_deferred_contact_profile(mapping)
         return mapping
 
@@ -566,6 +591,158 @@ class BridgeService:
                 mapping.id,
             )
 
+    async def _open_pending_conversation(self, mapping: ConversationMapping) -> None:
+        """Open a conversation Chatwoot created as `pending`.
+
+        With an Agent Bot on the inbox Chatwoot creates conversations as `pending` whatever status
+        was requested, which hides them from the agents' open list. A failure leaves the mapping
+        `pending`, so the customer's next message opens it through the usual reopen path.
+        """
+        if mapping.status != "pending":
+            return
+        try:
+            await self.chatwoot.toggle_status(
+                conversation_id=mapping.chatwoot_conversation_id,
+                status="open",
+            )
+        except IntegrationError as exc:
+            logger.warning(
+                "Could not open new Chatwoot conversation %s (HTTP %s)",
+                mapping.chatwoot_conversation_id,
+                exc.status_code,
+            )
+            return
+        mapping.status = "open"
+        await self.session.commit()
+
+    async def _sync_agent_assignment(
+        self,
+        mapping: ConversationMapping,
+        message: BlipMessage,
+    ) -> None:
+        """Assign the conversation to the Desk agent who just wrote, creating their Chatwoot user.
+
+        Only acts when the agent differs from the one last assigned, so a manual reassignment in
+        Chatwoot stands until the BLiP agent changes. Best effort like the shadow ticket: the
+        message is already mirrored, so a failure is logged and retried on the agent's next message.
+        """
+        if (
+            not self.settings.chatwoot_agent_sync
+            or message.metadata.get("#messageEmitter") != "Human"
+        ):
+            return
+        agent = message.metadata.get("#message.agentIdentity")
+        email = self._agent_display_name(agent).strip().lower() if agent else ""
+        if len(email) > 255 or not _EMAIL_SHAPE.match(email):
+            logger.info("Desk agent identity is not an e-mail; conversation not assigned")
+            return
+        if mapping.blip_agent_identity == email:
+            return
+        try:
+            user_id = await self._resolve_chatwoot_agent(email)
+            await self.chatwoot.assign_conversation(
+                conversation_id=mapping.chatwoot_conversation_id,
+                assignee_id=user_id,
+            )
+        except IntegrationError as exc:
+            # The user may have been deleted in Chatwoot; look it up again next time.
+            _AGENT_USER_IDS.pop((self.settings.chatwoot_account_id, email), None)
+            logger.warning(
+                "Could not assign Chatwoot conversation %s to its BLiP agent (HTTP %s)",
+                mapping.chatwoot_conversation_id,
+                exc.status_code,
+            )
+            return
+        mapping.blip_agent_identity = email
+        await self.session.commit()
+
+    async def _resolve_chatwoot_agent(self, email: str) -> int:
+        key = (self.settings.chatwoot_account_id, email)
+        if key in _AGENT_USER_IDS:
+            return _AGENT_USER_IDS[key]
+        async with _AGENT_LOCKS.setdefault(email, asyncio.Lock()):
+            if key in _AGENT_USER_IDS:
+                return _AGENT_USER_IDS[key]
+            user_id = await self._find_chatwoot_agent(email)
+            if user_id is None:
+                try:
+                    created = await self.chatwoot.create_agent(
+                        name=await self._agent_full_name(email),
+                        email=email,
+                    )
+                except IntegrationError as exc:
+                    if exc.status_code != 422:
+                        raise
+                    # Already taken: created elsewhere since the lookup above.
+                    user_id = await self._find_chatwoot_agent(email)
+                    if user_id is None:
+                        raise
+                else:
+                    user_id = self._required_int(created, "id", "Chatwoot agent")
+            # Additive and idempotent. An agent outside the inbox can be assigned a conversation
+            # but cannot see it, which also holds for agents that already existed in Chatwoot.
+            await self.chatwoot.add_inbox_agents([user_id])
+            _AGENT_USER_IDS[key] = user_id
+            return user_id
+
+    async def _find_chatwoot_agent(self, email: str) -> int | None:
+        for agent in await self.chatwoot.list_agents():
+            agent_id = agent.get("id")
+            if str(agent.get("email", "")).lower() == email and isinstance(agent_id, int):
+                return agent_id
+        return None
+
+    async def _agent_full_name(self, email: str) -> str:
+        """The operator's name in BLiP Desk, or one derived from the e-mail when unavailable."""
+        name = None
+        if self.settings.blip_agent_name_lookup:
+            name = await self._desk_attendant_name(email)
+        return name or self._agent_name_from_email(email)
+
+    async def _desk_attendant_name(self, email: str) -> str | None:
+        now = time.monotonic()
+        loaded_at = _ATTENDANTS.loaded_at
+        stale = loaded_at is None or now - loaded_at > _ATTENDANT_REFRESH_SECONDS
+        if email not in _ATTENDANTS.names and stale:
+            try:
+                attendants = await self.blip.get_attendants()
+            except IntegrationError as exc:
+                if exc.retryable:
+                    # Transient: wait for the agent's next message instead of creating the Chatwoot
+                    # user with a guessed name, which would stay there.
+                    raise
+                logger.warning(
+                    "Could not read BLiP Desk attendants (HTTP %s); naming the agent by e-mail",
+                    exc.status_code,
+                )
+                _ATTENDANTS.loaded_at = now
+                return None
+            _ATTENDANTS.names = self._attendant_names(attendants)
+            _ATTENDANTS.loaded_at = now
+        return _ATTENDANTS.names.get(email)
+
+    @staticmethod
+    def _attendant_names(attendants: list[dict[str, Any]]) -> dict[str, str]:
+        """Full names keyed by e-mail, from both the ``email`` field and the Desk identity."""
+        names: dict[str, str] = {}
+        for attendant in attendants:
+            full_name = str(attendant.get("fullName") or "").strip()
+            identity = attendant.get("identity")
+            addresses = [
+                attendant.get("email"),
+                BridgeService._agent_display_name(identity) if identity else None,
+            ]
+            for address in addresses:
+                if address and full_name:
+                    names[str(address).strip().lower()] = full_name
+        return names
+
+    @staticmethod
+    def _agent_name_from_email(email: str) -> str:
+        """``maria.silva@example.com`` -> ``Maria Silva``."""
+        words = re.split(r"[._+\-\s]+", email.partition("@")[0])
+        return " ".join(word.capitalize() for word in words if word) or email
+
     async def _get_mapping(self, customer_identity: str) -> ConversationMapping | None:
         return await self.session.scalar(
             select(ConversationMapping).where(
@@ -609,12 +786,10 @@ class BridgeService:
         )
 
     @staticmethod
-    def _outbound_label(message: BlipMessage, primary_bot: str = "") -> str:
+    def _outbound_label(message: BlipMessage, primary_bot: str = "") -> str | None:
+        """Prefix naming a bot sender; None for a Desk agent, who is shown by the assignment."""
         if message.metadata.get("#messageEmitter") == "Human":
-            agent = message.metadata.get("#message.agentIdentity")
-            return (
-                f"BLiP agent: {BridgeService._agent_display_name(agent)}" if agent else "BLiP agent"
-            )
+            return None
         node = message.from_.partition("/")[0]
         if primary_bot and node != primary_bot.partition("/")[0]:
             # Another bot of the same contract: say which one, since it isn't the configured bot.

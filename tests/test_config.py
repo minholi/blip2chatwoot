@@ -26,7 +26,12 @@ def test_read_only_mirror_does_not_require_blip_credentials() -> None:
 
 @pytest.mark.parametrize(
     "flag",
-    ["blip_ack_messages", "chatwoot_replies_to_blip", "blip_ticket_tag_sync_enabled"],
+    [
+        "blip_ack_messages",
+        "chatwoot_replies_to_blip",
+        "blip_ticket_tag_sync_enabled",
+        "blip_agent_name_lookup",
+    ],
 )
 def test_any_blip_write_requires_blip_credentials(flag) -> None:
     settings = Settings(_env_file=None, **_PRODUCTION, **{flag: True})
@@ -40,3 +45,12 @@ def test_production_rejects_a_non_positive_media_size_limit() -> None:
 
     with pytest.raises(ValueError, match="BLIP_MEDIA_MAX_BYTES"):
         settings.validate_for_environment()
+
+
+def test_agent_sync_is_off_by_default_and_needs_no_blip_credentials() -> None:
+    assert Settings(_env_file=None, **_PRODUCTION).chatwoot_agent_sync is False
+
+    enabled = Settings(_env_file=None, **_PRODUCTION, chatwoot_agent_sync=True)
+
+    enabled.validate_for_environment()
+    assert enabled.blip_writes_enabled is False

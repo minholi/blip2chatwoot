@@ -72,16 +72,42 @@ The API is available on `http://localhost:8000`. Health endpoints are
    `message_created`, `conversation_updated`, and
    `conversation_status_changed`.
 4. Store the generated webhook secret as `CHATWOOT_WEBHOOK_SECRET`.
-5. Create an Agent Bot, attach it to the inbox and set its access token as
-   `CHATWOOT_AGENT_BOT_TOKEN`. Mirrored bot and BLiP agent messages are posted as
-   this bot, so they are not attributed to a human user. Without it the bridge falls
-   back to `CHATWOOT_API_TOKEN`.
+5. Create an Agent Bot (no outgoing URL needed), attach it to the inbox and set its
+   access token as `CHATWOOT_AGENT_BOT_TOKEN`. Mirrored bot and BLiP agent messages are
+   posted as this bot, so they are not attributed to a human user. Without it the
+   bridge falls back to `CHATWOOT_API_TOKEN` and they appear as sent by that token's
+   user.
 6. Do not configure multiple Chatwoot callbacks for the same events unless the
    duplicate deliveries are intentionally routed to this same idempotent
    endpoint.
 
 The API token needs permission to create contacts, conversations, messages,
 labels, and message statuses.
+
+### Assigning conversations to BLiP Desk agents
+
+Set `CHATWOOT_AGENT_SYNC=true` to assign each conversation to the BLiP Desk agent who
+last wrote in it. A Desk agent's message carries the agent's e-mail
+(`#message.agentIdentity`); the bridge finds the Chatwoot agent with that e-mail, or
+creates one (role `agent`, named after the e-mail, added to the inbox) and assigns the
+conversation to them. **Chatwoot e-mails every newly created agent an invitation**, so
+turn this on only when that is acceptable. It is off by default, needs an administrator
+`CHATWOOT_API_TOKEN`, and never calls BLiP.
+
+New agents are named after the e-mail (`maria.silva@…` becomes "Maria Silva"). Set
+`BLIP_AGENT_NAME_LOOKUP=true` and `BLIP_DESK_AUTH_KEY` to use the operator's real name
+from BLiP Desk (`get /attendants`) instead; if BLiP is unreachable the agent is created
+on the agent's next message rather than with a guessed name, and if BLiP refuses the
+request the e-mail-derived name is used.
+
+The conversation is reassigned only when a different BLiP agent writes, so a manual
+reassignment in Chatwoot stands until then. The messages themselves are still posted
+by the Agent Bot, not as the agent's user, and carry no label: who is answering is shown
+by the conversation's assignee. Without `CHATWOOT_AGENT_SYNC`, Desk agent messages are
+therefore not attributed to anyone in Chatwoot. Messages from a bot still start with
+`[BLiP bot]` (or `[BLiP bot: <name>]` for a second bot of the contract).
+A Chatwoot failure while assigning is logged and retried on the agent's next message;
+it never blocks the mirror.
 
 ## BLiP configuration
 
@@ -110,9 +136,11 @@ with the sender `<bot>/<instance>`, and keys the conversations. Any other
 treated as a bot: its messages are mirrored into the customer's conversation with a
 `[BLiP bot: <name>]` label instead of creating a "customer" named after the bot.
 
-`BLIP_CONTRACT_ID` and `BLIP_AUTH_KEY` are only needed when a BLiP write switch is
-on. The bridge then sends to `https://<contract_id>.http.msging.net/messages`
-using `Authorization: Key ...`.
+`BLIP_CONTRACT_ID` and `BLIP_AUTH_KEY` are only needed when a BLiP switch is on. The
+bridge then sends to `https://<contract_id>.http.msging.net/messages` using
+`Authorization: Key ...`. Each bot has its own key, and a bot only has a Desk if one
+was configured for it, so commands to `postmaster@desk.msging.net` (tickets, tags,
+attendants) use `BLIP_DESK_AUTH_KEY` when it is set and `BLIP_AUTH_KEY` otherwise.
 
 The route tokens are optional during local development, but high-entropy tokens
 behind HTTPS are required in production because the BLiP HTTP callback contract

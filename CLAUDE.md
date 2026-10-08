@@ -24,11 +24,13 @@ alembic upgrade head       # needed before starting against Postgres when AUTO_C
 
 A **read-only mirror by default**: everything BLiP sends is copied into a Chatwoot API inbox — customer
 messages as `incoming`, bot and BLiP Desk agent messages as `outgoing` posted with the Agent Bot token
-(`CHATWOOT_AGENT_BOT_TOKEN`). Writing to BLiP is opt-in via three independent switches (see
+(`CHATWOOT_AGENT_BOT_TOKEN`). Calling BLiP at all is opt-in via four independent switches (see
 `Settings.blip_writes_enabled`): `BLIP_ACK_MESSAGES` (`consumed`/`failed` notifications),
-`CHATWOOT_REPLIES_TO_BLIP` (public agent replies → BLiP) and `BLIP_TICKET_TAG_SYNC_ENABLED` (labels ⇄
-Desk ticket tags). Any new code that calls `BlipClient` must sit behind one of them. Two processes share
-one database and communicate only through it.
+`CHATWOOT_REPLIES_TO_BLIP` (public agent replies → BLiP), `BLIP_TICKET_TAG_SYNC_ENABLED` (labels ⇄
+Desk ticket tags) and `BLIP_AGENT_NAME_LOOKUP` (read-only `get /attendants`). Any new code that calls
+`BlipClient` must sit behind one of them. Commands to `postmaster@desk.msging.net` use
+`BLIP_DESK_AUTH_KEY` when set (the main bot's key may have no Desk configured), else `BLIP_AUTH_KEY`.
+Two processes share one database and communicate only through it.
 
 **Webhook → outbox → worker pipeline**
 - `app/api.py` handlers only authenticate, validate the envelope, and call `enqueue_event`
@@ -62,7 +64,29 @@ one database and communicate only through it.
   must never reach BLiP. Layers: the replies switch; `content_attributes.blip_message_id` on the payload;
   a `MessageDelivery(status="mirrored")` row written in the same commit as `result_id`. The reverse echo
   (BLiP's copy of a message the bridge sent) is dropped because its `blip_message_id` already has a
-  `MessageDelivery`. Chatwoot's webhook `sender.type` for agent bots is unverified, so don't rely on it.
+  `MessageDelivery`. The Chatwoot webhook reports `sender.type == "agent_bot"` for messages posted with the
+  Agent Bot token (checked 2026-10-08), but with `CHATWOOT_AGENT_BOT_TOKEN` empty the bridge falls back to
+  the API token and they arrive as `user` — so don't rely on the sender type.
+- **Agent assignment** (`CHATWOOT_AGENT_SYNC`, default off; Chatwoot-only apart from the name lookup): after a
+  `#messageEmitter: Human` message is mirrored, `_sync_agent_assignment` assigns the Chatwoot conversation to
+  the Desk agent in `#message.agentIdentity` (an e-mail). The Chatwoot user is looked up by e-mail
+  (`list_agents`), else created as role `agent` (**Chatwoot e-mails them an invitation**); either way
+  added to the inbox (additive and idempotent: an agent outside it can be assigned but can't see the
+  conversation); ids are cached per worker in `_AGENT_USER_IDS`. With `BLIP_AGENT_NAME_LOOKUP` the new
+  agent is named after `fullName` from BLiP Desk `get /attendants` (cached per worker in `_ATTENDANTS`,
+  matched by `email` or by the Desk identity); otherwise, or when BLiP refuses, from the e-mail
+  (`maria.silva@…` → "Maria Silva"). A transient BLiP error (timeout/429/5xx) defers creating the agent to
+  the next message instead of naming it by guess, since the name would stay in Chatwoot. `ConversationMapping.blip_agent_identity` holds the
+  last assignee, so it reassigns only when the BLiP agent changes (a manual reassignment in Chatwoot stands
+  until then). Best effort like the shadow ticket: `IntegrationError` is logged and retried on the agent's
+  next message, never failing the event. Messages are still posted by the Agent Bot: posting as the agent's
+  own user needs a per-user token (Chatwoot Platform API; the message API has no `sender` parameter) and is
+  not implemented — `ChatwootClient._request(api_token=...)` is the hook for it.
+- **Agent Bot on the inbox**: Chatwoot then creates conversations as `pending` whatever `status` is
+  requested (verified 2026-10-08), hiding them from the agents' open list. `_create_mapping` stores the status
+  Chatwoot returned and `_open_pending_conversation` toggles `pending` to `open`; if that fails the mapping
+  stays `pending` and the customer's next message reopens it. Other statuses (e.g. `resolved` for a
+  blocked contact) are left alone.
 
 **Webhook auth**: Chatwoot uses an HMAC signature + timestamp (`app/security.py`), enforced only if
 `CHATWOOT_WEBHOOK_SECRET` is set. BLiP has no signature, so it uses a route path token (or
@@ -79,8 +103,9 @@ and without `{path_token}`) remain. Without the path token only the header authe
   points; empty = removed); other types fall back to `[BLiP message type: …]` + serialized JSON. Customer
   media (image/audio/document/location) has never been observed — no renderer beyond the generic `uri` path.
 - Bot → customer (`from` = `<bot>@msging.net/<instance>`, ~80% of message envelopes): mirrored as `outgoing`
-  with a `[BLiP agent: <email>]` / `[BLiP bot]` prefix (`#messageEmitter: Human` +
-  `#message.agentIdentity`, URL-encoded `user%40domain@blip.ai`, mark a Desk agent). Routing lives in
+  with a `[BLiP bot]` / `[BLiP bot: <name>]` prefix, or none for a Desk agent (`#messageEmitter: Human` +
+  `#message.agentIdentity`, URL-encoded `user%40domain@blip.ai`): the agent is shown by the conversation
+  assignment (`CHATWOOT_AGENT_SYNC`), not in the text. Routing lives in
   `_route_message`; a sender is a bot when it is `BLIP_BOT_IDENTITY` or any `<name>@msging.net[/instance]`
   (`is_bot_node`) — customers live on channel gateways (`@wa.gw.msging.net`, `@broadcast.msging.net`), never
   on the bare domain. A second bot of the contract (a "receptive" bot, `<other>@msging.net/<router pod>`,
@@ -118,7 +143,7 @@ and without `{path_token}`) remain. Without the path token only the header authe
 **Config & schema**
 - `app/config.py::Settings` (pydantic-settings, `.env`). `validate_for_environment()` is a no-op unless
   `APP_ENV=production`, where it requires the credentials/tokens and `postgresql+asyncpg://`
-  (`BLIP_CONTRACT_ID`/`BLIP_AUTH_KEY` only when a BLiP write switch is on). It runs in
+  (`BLIP_CONTRACT_ID`/`BLIP_AUTH_KEY` only when a BLiP switch is on). It runs in
   `create_runtime` and in `migrations/env.py`.
 - `app/runtime.py::Runtime` bundles settings, engine, session factory, shared `httpx.AsyncClient`, the
   two API clients and the `MediaDownloader`; it lives on `app.state.runtime` (API) or is built in
@@ -130,8 +155,9 @@ and without `{path_token}`) remain. Without the path token only the header authe
   and the message falls back to a text link; timeouts/429/5xx raise a retryable `IntegrationError`.
 - Schema: `AUTO_CREATE_SCHEMA=true` runs `Base.metadata.create_all` at startup (dev/SQLite). Production
   uses Alembic — changing `app/models.py` requires a hand-checked new revision under
-  `migrations/versions/` (only `0001_initial` exists). `migrations/env.py` takes the DB URL from
-  `Settings`, not `alembic.ini`.
+  `migrations/versions/` (`0001_initial`, `0002_conversation_agent`). `migrations/env.py` takes the DB URL
+  from `Settings`, not `alembic.ini`. `create_all` never alters an existing table, so an old SQLite dev DB
+  needs `alembic upgrade head` (or an `ALTER TABLE`) after a model change.
 - `BLIP_TICKET_TAG_SYNC_ENABLED` (default off) gates shadow BLiP Desk tickets and label sync; failures
   creating a shadow ticket must not block message delivery.
 

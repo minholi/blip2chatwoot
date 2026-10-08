@@ -18,14 +18,23 @@ class Settings(BaseSettings):
     chatwoot_webhook_secret: str = ""
     chatwoot_agent_bot_token: str = ""
     chatwoot_replies_to_blip: bool = False
+    # Assign each conversation to the BLiP Desk agent who last wrote in it, creating that agent's
+    # Chatwoot user when missing (Chatwoot e-mails them an invitation). Only calls Chatwoot.
+    chatwoot_agent_sync: bool = False
 
     blip_contract_id: str = ""
     blip_auth_key: str = ""
+    # Key of the bot that owns the BLiP Desk. Commands to postmaster@desk.msging.net (tickets, tags,
+    # attendants) use it when set; the main bot's key may have no Desk configured.
+    blip_desk_auth_key: str = ""
     blip_bot_identity: str = ""
     blip_inbound_path_token: str = ""
     blip_notification_path_token: str = ""
     blip_ack_messages: bool = False
     blip_ticket_tag_sync_enabled: bool = False
+    # Read the operator's full name from BLiP Desk (`get /attendants`) when creating their Chatwoot
+    # agent, instead of deriving one from the e-mail. Only used with CHATWOOT_AGENT_SYNC.
+    blip_agent_name_lookup: bool = False
     blip_label_poll_seconds: int = 60
     # BLiP media links are short-lived signed URLs; attach the file in Chatwoot instead of linking.
     blip_media_attachments: bool = True
@@ -53,6 +62,7 @@ class Settings(BaseSettings):
             self.blip_ack_messages
             or self.chatwoot_replies_to_blip
             or self.blip_ticket_tag_sync_enabled
+            or self.blip_agent_name_lookup
         )
 
     @property

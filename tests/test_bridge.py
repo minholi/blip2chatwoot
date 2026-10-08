@@ -280,7 +280,7 @@ async def test_bot_message_is_mirrored_as_outgoing_and_never_acknowledged(
         assert chatwoot.create_contact.await_args.kwargs["identifier"] == CUSTOMER
         chatwoot.create_message.assert_awaited_once_with(
             conversation_id=200,
-            content="[BLiP agent: agent@example.com]\nHi there",
+            content="Hi there",
             message_type="outgoing",
             content_attributes={"blip_message_id": "blip-out-1", "blip_direction": "outbound"},
             as_agent_bot=True,
@@ -709,7 +709,7 @@ def test_reaction_with_no_emoji_is_a_removal_and_ignores_invalid_code_points() -
     assert BridgeService._blip_content_as_text(invalid) == "[Reaction: 👍]"
 
 
-def test_desk_agent_label_is_decoded() -> None:
+def test_desk_agent_messages_carry_no_label() -> None:
     message = _blip_content(
         "text/plain",
         "hi",
@@ -719,7 +719,7 @@ def test_desk_agent_label_is_decoded() -> None:
         },
     )
 
-    assert BridgeService._outbound_label(message) == "BLiP agent: jane.doe@example.com"
+    assert BridgeService._outbound_label(message) is None
 
 
 def _media_event(settings, *, sender: str) -> InboundEvent:
@@ -766,6 +766,40 @@ async def test_agent_media_is_attached_instead_of_linked(session_factory, settin
         chatwoot.create_message.assert_awaited_once_with(
             conversation_id=200,
             content="[BLiP bot]",
+            message_type="outgoing",
+            content_attributes={"blip_message_id": "blip-media-1", "blip_direction": "outbound"},
+            as_agent_bot=True,
+            attachments=[("Contract.pdf", b"%PDF", "application/pdf")],
+        )
+        assert event.status == "processed"
+
+
+@pytest.mark.asyncio
+async def test_desk_agent_file_is_attached_without_any_text(session_factory, settings) -> None:
+    chatwoot = _chatwoot_mock()
+    media = AsyncMock(spec=MediaDownloader)
+    media.download.return_value = DownloadedMedia("Contract.pdf", "application/pdf", b"%PDF")
+    async with session_factory() as session:
+        event = _media_event(settings, sender=f"{settings.blip_bot_identity}/router-1")
+        event.payload["metadata"] = {
+            "#messageEmitter": "Human",
+            "#message.agentIdentity": "jane.doe%40example.com@blip.ai",
+        }
+        session.add(event)
+        await session.commit()
+
+        service = BridgeService(
+            session=session,
+            settings=settings,
+            blip=AsyncMock(spec=BlipClient),
+            chatwoot=chatwoot,
+            media=media,
+        )
+        await service.process_blip_message(event)
+
+        chatwoot.create_message.assert_awaited_once_with(
+            conversation_id=200,
+            content="",
             message_type="outgoing",
             content_attributes={"blip_message_id": "blip-media-1", "blip_direction": "outbound"},
             as_agent_bot=True,
@@ -997,3 +1031,84 @@ def test_labels_name_the_bot_only_when_it_is_not_the_configured_one() -> None:
     assert BridgeService._outbound_label(primary, "mybot@msging.net") == "BLiP bot"
     assert BridgeService._outbound_label(other, "mybot@msging.net") == "BLiP bot: otherbot"
     assert BridgeService._outbound_label(other) == "BLiP bot"
+
+
+@pytest.mark.asyncio
+async def test_conversation_created_pending_by_an_agent_bot_inbox_is_opened(
+    session_factory,
+    settings,
+) -> None:
+    chatwoot = _chatwoot_mock()
+    chatwoot.create_conversation.return_value = {"id": 200, "status": "pending"}
+    async with session_factory() as session:
+        event = _blip_event("blip-in-1", **{"from": CUSTOMER, "content": "Hi"})
+        session.add(event)
+        await session.commit()
+
+        service = BridgeService(
+            session=session, settings=settings, blip=AsyncMock(spec=BlipClient), chatwoot=chatwoot
+        )
+        await service.process_blip_message(event)
+
+        chatwoot.toggle_status.assert_awaited_once_with(conversation_id=200, status="open")
+        mapping = await session.scalar(select(ConversationMapping))
+        assert mapping.status == "open"
+        assert event.status == "processed"
+
+
+@pytest.mark.asyncio
+async def test_failing_to_open_a_new_conversation_leaves_it_to_the_next_message(
+    session_factory,
+    settings,
+) -> None:
+    chatwoot = _chatwoot_mock()
+    chatwoot.create_conversation.return_value = {"id": 200, "status": "pending"}
+    chatwoot.toggle_status.side_effect = [
+        IntegrationError("Chatwoot returned HTTP 500", retryable=True, status_code=500),
+        {},
+    ]
+    async with session_factory() as session:
+        service = BridgeService(
+            session=session, settings=settings, blip=AsyncMock(spec=BlipClient), chatwoot=chatwoot
+        )
+        first = _blip_event("blip-in-1", **{"from": CUSTOMER, "content": "Hi"})
+        session.add(first)
+        await session.commit()
+        await service.process_blip_message(first)
+        mapping = await session.scalar(select(ConversationMapping))
+        assert (first.status, mapping.status) == ("processed", "pending")
+
+        chatwoot.create_message.return_value = {"id": 301}
+        second = _blip_event("blip-in-2", **{"from": CUSTOMER, "content": "Anyone?"})
+        session.add(second)
+        await session.commit()
+        await service.process_blip_message(second)
+
+        assert mapping.status == "open"
+        assert chatwoot.toggle_status.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["open", "resolved", None])
+async def test_other_new_conversation_statuses_are_left_alone(
+    session_factory,
+    settings,
+    status,
+) -> None:
+    chatwoot = _chatwoot_mock()
+    chatwoot.create_conversation.return_value = (
+        {"id": 200} if status is None else {"id": 200, "status": status}
+    )
+    async with session_factory() as session:
+        event = _blip_event("blip-in-1", **{"from": CUSTOMER, "content": "Hi"})
+        session.add(event)
+        await session.commit()
+
+        service = BridgeService(
+            session=session, settings=settings, blip=AsyncMock(spec=BlipClient), chatwoot=chatwoot
+        )
+        await service.process_blip_message(event)
+
+        chatwoot.toggle_status.assert_not_awaited()
+        mapping = await session.scalar(select(ConversationMapping))
+        assert mapping.status == (status or "open")
