@@ -82,6 +82,8 @@ async def run_once(runtime: Runtime) -> bool:
                 await service.process_blip_contact(event)
             elif job.kind == "chatwoot_event":
                 await service.process_chatwoot_event(event)
+            elif job.kind == "captain_start":
+                await service.process_captain_start(event)
             else:
                 raise IntegrationError(f"Unknown outbox job kind: {job.kind}", retryable=False)
         except IntegrationError as exc:

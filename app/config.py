@@ -49,6 +49,17 @@ class Settings(BaseSettings):
     # A customer message in a Captain conversation that isn't open keeps it `pending` only while
     # the router still has the customer there; otherwise the session ends and it opens as usual.
     captain_blip_subbot: str = ""
+    # `POST /webhooks/captain/start`: BLiP tells the bridge that it just handed a
+    # customer to the Captain's sub-bot (whatever the entry: icebreaker, night window, lead ads...),
+    # with the customer's message and the origin. The bridge starts the session and posts that
+    # message, so the Captain answers it. Empty = endpoint off (404). The secret goes in the
+    # `X-Bridge-Token` header only (a token in the URL would end up in proxy and tunnel logs).
+    captain_start_token: str = ""
+    # Label added at the start, `<prefix><origin>` (e.g. `origem-leadads`); empty = no origin label.
+    captain_start_origin_label_prefix: str = "origem-"
+    # Posted instead of the customer's text when it isn't sent, or when it is already in the
+    # conversation, so the Captain still has a new message to answer.
+    captain_start_fallback_text: str = "[Início automático: lead encaminhado à Camila]"
     # Also start a session for any customer message while the router has the customer in
     # CAPTAIN_BLIP_SUBBOT, not only for the icebreaker phrases (e.g. a night window that BLiP turns
     # on and off on its side). One `master-state` read per customer message that has no active
@@ -107,8 +118,8 @@ class Settings(BaseSettings):
         # Without the sub-bot every returning customer would be treated as having left the Captain.
         if self.captain_enabled and not self.captain_blip_subbot.strip():
             raise ValueError(
-                "CAPTAIN_BLIP_SUBBOT is required when CAPTAIN_TRIGGER_PHRASES or "
-                "CAPTAIN_FOLLOW_MASTER_STATE is set"
+                "CAPTAIN_BLIP_SUBBOT is required when CAPTAIN_TRIGGER_PHRASES, "
+                "CAPTAIN_FOLLOW_MASTER_STATE or CAPTAIN_START_TOKEN is set"
             )
         return self
 
@@ -119,7 +130,11 @@ class Settings(BaseSettings):
 
     @property
     def captain_enabled(self) -> bool:
-        return bool(self.captain_trigger_phrase_set) or self.captain_follow_master_state
+        return (
+            bool(self.captain_trigger_phrase_set)
+            or self.captain_follow_master_state
+            or bool(self.captain_start_token)
+        )
 
     @property
     def captain_session_label_list(self) -> list[str]:

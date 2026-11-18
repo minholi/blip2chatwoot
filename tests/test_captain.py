@@ -1,6 +1,7 @@
 """Captain sessions started by a BLiP icebreaker (CAPTAIN_* settings)."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
 
 import httpx
@@ -14,7 +15,9 @@ from app.integrations.chatwoot import ChatwootClient
 from app.integrations.errors import IntegrationError
 from app.models import ConversationMapping, InboundEvent, MessageDelivery
 from app.services.bridge import BridgeService
+from app.services.queue import enqueue_event
 from app.services.whatsapp_format import markdown_to_whatsapp
+from app.worker import run_once
 
 CUSTOMER = "551199999999@wa.gw.msging.net"
 SUBBOT = "puccampinascamila@msging.net"
@@ -1031,3 +1034,311 @@ async def test_master_state_other_failure_raises(settings) -> None:
 )
 def test_markdown_to_whatsapp(text, expected) -> None:
     assert markdown_to_whatsapp(text) == expected
+
+
+# --- start endpoint: BLiP tells the bridge a customer entered the sub-bot -------------------
+
+START_TOKEN = "start-secret"
+
+
+@pytest.fixture
+def start_settings(captain_settings: Settings) -> Settings:
+    captain_settings.captain_trigger_phrases = ""
+    captain_settings.captain_start_token = START_TOKEN
+    captain_settings.captain_new_conversation_per_session = True
+    return captain_settings
+
+
+def _start_event(
+    *, origin: str | None = "leadads", message_id: str | None = "m-9", content: str | None = "Oi"
+) -> InboundEvent:
+    payload = {"identity": CUSTOMER}
+    if origin:
+        payload["origin"] = origin
+    if message_id:
+        payload["message_id"] = message_id
+    if content:
+        payload["content"] = content
+    return InboundEvent(
+        provider="captain",
+        external_id=f"captain_start:{CUSTOMER}:{message_id or 't1'}",
+        event_type="captain_start",
+        payload=payload,
+    )
+
+
+async def _start(session, settings, chatwoot, event, blip=None) -> None:
+    session.add(event)
+    await session.commit()
+    service = BridgeService(
+        session=session,
+        settings=settings,
+        blip=blip or AsyncMock(spec=BlipClient),
+        chatwoot=chatwoot,
+    )
+    await service.process_captain_start(event)
+
+
+def test_start_token_enables_the_captain_and_needs_the_subbot() -> None:
+    with pytest.raises(ValidationError, match="CAPTAIN_START_TOKEN"):
+        Settings(_env_file=None, captain_start_token="x")
+    settings = Settings(_env_file=None, captain_start_token="x", captain_blip_subbot=SUBBOT)
+    assert settings.captain_enabled
+
+
+@pytest.mark.asyncio
+async def test_start_for_a_new_lead_opens_the_session_and_posts_the_message(
+    session_factory, start_settings
+) -> None:
+    chatwoot = _chatwoot()
+    async with session_factory() as session:
+        await _start(session, start_settings, chatwoot, _start_event())
+
+        mapping = await session.scalar(select(ConversationMapping))
+        assert mapping.captain_active is True
+        assert mapping.status == "pending"
+        assert mapping.chatwoot_labels == ["camila", "bot-venda-inicio", "origem-leadads"]
+        chatwoot.create_conversation.assert_awaited_once()
+        chatwoot.toggle_status.assert_not_awaited()
+        kwargs = chatwoot.create_message.await_args.kwargs
+        assert kwargs["content"] == "Oi"
+        assert kwargs["message_type"] == "incoming"
+        assert kwargs["content_attributes"] == {"captain_start": True, "blip_message_id": "m-9"}
+        event = await session.scalar(select(InboundEvent))
+        assert event.status == "processed"
+        assert event.result_id == "300"
+        delivery = await session.scalar(select(MessageDelivery))
+        assert (delivery.blip_message_id, delivery.status) == ("m-9", "mirrored")
+
+
+@pytest.mark.asyncio
+async def test_start_creates_the_shadow_ticket_when_tag_sync_is_on(
+    session_factory, start_settings
+) -> None:
+    start_settings.blip_ticket_tag_sync_enabled = True
+    blip = AsyncMock(spec=BlipClient)
+    blip.create_shadow_ticket.return_value = "ticket-1"
+    async with session_factory() as session:
+        await _start(session, start_settings, _chatwoot(), _start_event(), blip=blip)
+
+        mapping = await session.scalar(select(ConversationMapping))
+        assert mapping.blip_ticket_id == "ticket-1"
+        blip.create_shadow_ticket.assert_awaited_once_with(CUSTOMER)
+
+
+@pytest.mark.asyncio
+async def test_start_for_a_finished_session_gets_a_new_conversation(
+    session_factory, start_settings
+) -> None:
+    chatwoot = _chatwoot_with_history()
+    async with session_factory() as session:
+        session.add(_mapping(start_settings, status="resolved", chatwoot_labels=["saida-sair"]))
+        await session.commit()
+        await _start(session, start_settings, chatwoot, _start_event(origin="noturno"))
+
+        mapping = await session.scalar(select(ConversationMapping))
+        assert mapping.chatwoot_conversation_id == 201
+        assert mapping.captain_active is True
+        assert mapping.chatwoot_labels == ["camila", "bot-venda-inicio", "origem-noturno"]
+        assert chatwoot.create_message.await_args.kwargs["conversation_id"] == 201
+
+
+@pytest.mark.asyncio
+async def test_start_while_the_session_is_ongoing_does_nothing(
+    session_factory, start_settings
+) -> None:
+    """The icebreaker (or the router state) already opened it."""
+    chatwoot = _chatwoot_with_history()
+    async with session_factory() as session:
+        session.add(_mapping(start_settings, status="pending", captain_active=True))
+        await session.commit()
+        await _start(session, start_settings, chatwoot, _start_event())
+
+        chatwoot.create_conversation.assert_not_awaited()
+        chatwoot.create_message.assert_not_awaited()
+        event = await session.scalar(select(InboundEvent))
+        assert event.status == "ignored"
+
+
+@pytest.mark.asyncio
+async def test_start_reuses_the_conversation_whose_only_message_is_the_copy_of_the_lead(
+    session_factory, start_settings
+) -> None:
+    chatwoot = _chatwoot()
+    chatwoot.get_messages.return_value = [
+        {"id": 1, "message_type": 0, "content_attributes": {"blip_message_id": "m-9"}}
+    ]
+    async with session_factory() as session:
+        session.add(_mapping(start_settings, status="open"))
+        await session.commit()
+        await _start(session, start_settings, chatwoot, _start_event())
+
+        chatwoot.create_conversation.assert_not_awaited()
+        mapping = await session.scalar(select(ConversationMapping))
+        assert mapping.chatwoot_conversation_id == 200
+        assert mapping.captain_active is True
+
+
+@pytest.mark.asyncio
+async def test_start_after_the_copy_was_mirrored_posts_the_marker(
+    session_factory, start_settings
+) -> None:
+    chatwoot = _chatwoot()
+    chatwoot.get_messages.return_value = [
+        {"id": 77, "message_type": 0, "content_attributes": {"blip_message_id": "m-9"}}
+    ]
+    async with session_factory() as session:
+        session.add(_mapping(start_settings, status="open"))
+        await session.commit()
+        await _start(session, start_settings, chatwoot, _start_event())
+
+        kwargs = chatwoot.create_message.await_args.kwargs
+        assert kwargs["content"] == start_settings.captain_start_fallback_text
+        assert kwargs["content_attributes"] == {"captain_start": True}
+        assert (await session.scalar(select(MessageDelivery))) is None
+
+
+@pytest.mark.asyncio
+async def test_copy_arriving_before_the_start_is_not_posted_twice(
+    session_factory, start_settings
+) -> None:
+    """BLiP's normal webhook mirrors the lead's message first; the start call must not re-post it.
+
+    An inbound mirror records no MessageDelivery, so the copy has to be found in the conversation.
+    """
+    chatwoot = _chatwoot()
+    async with session_factory() as session:
+        await _process(
+            session,
+            start_settings,
+            AsyncMock(spec=BlipClient),
+            chatwoot,
+            _customer_event("Oi", message_id="m-9"),
+        )
+        chatwoot.get_messages.return_value = [
+            {"id": 77, "message_type": 0, "content_attributes": {"blip_message_id": "m-9"}}
+        ]
+        chatwoot.create_message.reset_mock()
+        await _start(
+            session, start_settings, chatwoot, _start_event(content="Oi", message_id="m-9")
+        )
+
+        kwargs = chatwoot.create_message.await_args.kwargs
+        assert kwargs["content"] == start_settings.captain_start_fallback_text
+        assert "blip_message_id" not in kwargs["content_attributes"]
+        mapping = await session.scalar(select(ConversationMapping))
+        assert mapping.chatwoot_conversation_id == 200
+        assert mapping.captain_active is True
+        assert (await session.scalar(select(MessageDelivery))) is None
+
+
+@pytest.mark.asyncio
+async def test_later_copy_of_the_start_message_is_dropped_as_an_echo(
+    session_factory, start_settings
+) -> None:
+    chatwoot = _chatwoot()
+    async with session_factory() as session:
+        await _start(session, start_settings, chatwoot, _start_event())
+        chatwoot.create_message.reset_mock()
+        await _process(
+            session,
+            start_settings,
+            AsyncMock(spec=BlipClient),
+            chatwoot,
+            _customer_event("Oi", message_id="m-9"),
+        )
+        chatwoot.create_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_without_content_or_origin_posts_the_marker_without_origin_label(
+    session_factory, start_settings
+) -> None:
+    chatwoot = _chatwoot()
+    async with session_factory() as session:
+        await _start(
+            session,
+            start_settings,
+            chatwoot,
+            _start_event(origin=None, message_id=None, content=None),
+        )
+        mapping = await session.scalar(select(ConversationMapping))
+        assert mapping.chatwoot_labels == ["camila", "bot-venda-inicio"]
+        kwargs = chatwoot.create_message.await_args.kwargs
+        assert kwargs["content"] == start_settings.captain_start_fallback_text
+        assert (await session.scalar(select(MessageDelivery))) is None
+
+
+@pytest.mark.asyncio
+async def test_start_origin_is_slugged(session_factory, start_settings) -> None:
+    chatwoot = _chatwoot()
+    async with session_factory() as session:
+        await _start(session, start_settings, chatwoot, _start_event(origin=" Lead Ads! "))
+        mapping = await session.scalar(select(ConversationMapping))
+        assert "origem-lead-ads" in mapping.chatwoot_labels
+
+
+@pytest.mark.asyncio
+async def test_start_retry_after_the_session_opened_does_not_restart_it(
+    session_factory, start_settings
+) -> None:
+    chatwoot = _chatwoot()
+    async with session_factory() as session:
+        session.add(_mapping(start_settings, status="pending", captain_active=True))
+        await session.commit()
+        event = _start_event()
+        event.result_id = "session:200"
+        await _start(session, start_settings, chatwoot, event)
+
+        chatwoot.create_conversation.assert_not_awaited()
+        chatwoot.add_conversation_labels.assert_not_awaited()
+        assert chatwoot.create_message.await_args.kwargs["content"] == "Oi"
+        assert event.result_id == "300"
+
+
+@pytest.mark.asyncio
+async def test_start_retry_after_it_finished_is_ignored(session_factory, start_settings) -> None:
+    chatwoot = _chatwoot()
+    async with session_factory() as session:
+        session.add(_mapping(start_settings, status="pending", captain_active=True))
+        await session.commit()
+        event = _start_event()
+        event.result_id = "300"
+        await _start(session, start_settings, chatwoot, event)
+        chatwoot.create_message.assert_not_awaited()
+        assert event.status == "ignored"
+
+
+@pytest.mark.asyncio
+async def test_start_for_a_bot_node_is_ignored(session_factory, start_settings) -> None:
+    chatwoot = _chatwoot()
+    async with session_factory() as session:
+        event = _start_event()
+        event.payload = {**event.payload, "identity": "otherbot@msging.net/pod"}
+        await _start(session, start_settings, chatwoot, event)
+        chatwoot.create_contact.assert_not_awaited()
+        assert event.status == "ignored"
+
+
+@pytest.mark.asyncio
+async def test_worker_dispatches_captain_start(session_factory, start_settings) -> None:
+    chatwoot = _chatwoot()
+    async with session_factory() as session:
+        await enqueue_event(
+            session,
+            provider="captain",
+            external_id="captain_start:x:1",
+            delivery_id=None,
+            event_type="captain_start",
+            payload={"identity": CUSTOMER, "content": "Oi"},
+            job_kind="captain_start",
+        )
+    runtime = SimpleNamespace(
+        settings=start_settings,
+        session_factory=session_factory,
+        blip=AsyncMock(spec=BlipClient),
+        chatwoot=chatwoot,
+        media=None,
+    )
+    assert await run_once(runtime) is True
+    chatwoot.create_message.assert_awaited_once()

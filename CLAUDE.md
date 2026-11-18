@@ -117,6 +117,18 @@ Two processes share one database and communicate only through it.
   come back inside a finished session keep the conversation (only entries start a new one). The optional
   `CAPTAIN_SESSION_RESET_LABEL_PREFIXES` is the fallback for reused conversations: it runs at session
   start and when `_reopen_for_customer` resumes a non-`pending` session for the Captain, but never mid-session.
+  **Start endpoint** (`CAPTAIN_START_TOKEN`, 404 when empty; `POST /webhooks/captain/start`, header `X-Bridge-Token` only;
+  also needs `CAPTAIN_BLIP_SUBBOT`, like the other entry paths): BLiP's
+  sub-bot reports each entry once (`identity`, optional `origin`/`message_id`/`content`), so no entry has to be
+  guessed from the router state. `app/api.py` stores it as `captain_start` (dedupe by identity + message id, else
+  the minute) → `process_captain_start`: bot nodes ignored; an ongoing session (`_captain_session_ongoing`) is a
+  no-op; else new conversation per session (`_start_new_conversation(ignore_blip_message_id=...)` so the copy of
+  the lead's own message doesn't count as history), `_start_captain_session(extra_labels=[origem-<origin>])`, then
+  the lead's text is posted as `incoming` with a `MessageDelivery(status="mirrored")` for its `message_id` (BLiP's
+  later copy is dropped); if the current conversation already has that `blip_message_id` (the copy came first and
+  was mirrored as a normal incoming message, which records no delivery) or there is no text,
+  `CAPTAIN_START_FALLBACK_TEXT` is posted instead, since the Captain needs a new message. `event.result_id` is
+  `session:<conversation id>` after the session opens (a retry resumes at the message), the Chatwoot message id when done.
 
 **Webhook auth**: Chatwoot uses an HMAC signature + timestamp (`app/security.py`), enforced only if
 `CHATWOOT_WEBHOOK_SECRET` is set. BLiP has no signature, so it uses a route path token (or

@@ -339,3 +339,115 @@ async def test_blip_webhook_has_no_route_at_the_root(session_factory, settings) 
     assert base.status_code == 200
     async with session_factory() as session:
         assert len((await session.scalars(select(InboundEvent))).all()) == 1
+
+
+def _start_app(session_factory, settings) -> FastAPI:
+    app = FastAPI()
+    app.include_router(router)
+    app.state.runtime = SimpleNamespace(settings=settings, session_factory=session_factory)
+    return app
+
+
+@pytest.mark.asyncio
+async def test_captain_start_is_off_without_a_token(session_factory, settings) -> None:
+    app = _start_app(session_factory, settings)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/webhooks/captain/start", json={"identity": "5511@wa.gw.msging.net"}
+        )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_captain_start_needs_the_header_token(session_factory, settings) -> None:
+    settings.captain_start_token = "start-secret"
+    settings.captain_blip_subbot = "sub@msging.net"
+    app = _start_app(session_factory, settings)
+    body = {"identity": "5511@wa.gw.msging.net"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        wrong = await client.post(
+            "/webhooks/captain/start", json=body, headers={"X-Bridge-Token": "nope"}
+        )
+        missing = await client.post("/webhooks/captain/start", json=body)
+        in_the_url = await client.post("/webhooks/captain/start/start-secret", json=body)
+        header = await client.post(
+            "/webhooks/captain/start", json=body, headers={"X-Bridge-Token": "start-secret"}
+        )
+        # A non-ASCII header must be a 401, not a TypeError from compare_digest.
+        non_ascii = await client.post(
+            "/webhooks/captain/start",
+            json=body,
+            headers={b"X-Bridge-Token": "é".encode("latin-1")},
+        )
+    assert wrong.status_code == 401
+    assert missing.status_code == 401
+    assert in_the_url.status_code == 404  # no such route: the token is never accepted in the URL
+    assert non_ascii.status_code == 401
+    assert header.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_captain_start_rejects_an_oversized_identity_or_dedupe_key(
+    session_factory, settings
+) -> None:
+    settings.captain_start_token = "start-secret"
+    settings.captain_blip_subbot = "sub@msging.net"
+    app = _start_app(session_factory, settings)
+    auth = {"X-Bridge-Token": "start-secret"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        oversized_identity = await client.post(
+            "/webhooks/captain/start",
+            json={"identity": f"{'a' * 250}@wa.gw.msging.net"},
+            headers=auth,
+        )
+        oversized_key = await client.post(
+            "/webhooks/captain/start",
+            json={"identity": f"{'a' * 250}@x", "message_id": "b" * 255},
+            headers=auth,
+        )
+    assert oversized_identity.status_code == 422
+    assert oversized_key.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_captain_start_enqueues_once_and_validates(session_factory, settings) -> None:
+    settings.captain_start_token = "start-secret"
+    settings.captain_blip_subbot = "sub@msging.net"
+    app = _start_app(session_factory, settings)
+    auth = {"X-Bridge-Token": "start-secret"}
+    body = {
+        "identity": " 5511@wa.gw.msging.net ",
+        "origin": "leadads",
+        "message_id": 123,
+        "content": "Oi",
+        "ignored": "x",
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = await client.post("/webhooks/captain/start", json=body, headers=auth)
+        again = await client.post("/webhooks/captain/start", json=body, headers=auth)
+        invalid = await client.post("/webhooks/captain/start", json={"identity": "x"}, headers=auth)
+
+    assert first.status_code == 200
+    assert first.json()["duplicate"] is False
+    assert again.json()["duplicate"] is True
+    assert invalid.status_code == 422
+    async with session_factory() as session:
+        event = await session.scalar(select(InboundEvent))
+        assert event.event_type == "captain_start"
+        assert event.payload == {
+            "identity": "5511@wa.gw.msging.net",
+            "origin": "leadads",
+            "message_id": "123",
+            "content": "Oi",
+        }
+        jobs = (await session.scalars(select(OutboxJob))).all()
+        assert len(jobs) == 1
+        assert jobs[0].kind == "captain_start"
